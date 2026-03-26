@@ -8,6 +8,10 @@ PyRICE 32 translates the GAMS-based RICE50x model into a modular Python package 
 
 Modular architecture with ~110 equations verified against the native GAMS source.
 
+![Global CO2 Emission Pathways](docs/spaghetti_emissions.png)
+
+*Global CO2 emission pathways across 30 scenarios (5 policies x 2 damage functions x 3 MACC cost assumptions). Solid lines show the median MACC (prob50); shaded bands span prob25-prob75 uncertainty.*
+
 ## Features
 
 ### Policies (11)
