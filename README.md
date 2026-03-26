@@ -6,7 +6,7 @@ Python/GAMSPy implementation of the [RICE50x](https://github.com/witch-team/RICE
 
 PyRICE 32 translates the GAMS-based RICE50x model into a modular Python package using [GAMSPy](https://gamspy.readthedocs.io/). The model aggregates 155 ISO3 countries into 32 [GCAM](https://jgcri.github.io/gcam-doc/) regions and solves a Ramsey-type optimal growth model coupled with a climate system, damage functions, and abatement cost curves.
 
-**9,195 lines | 33 files | ~110 equations | A+ audit grade against native GAMS source**
+Modular architecture with ~110 equations verified against the native GAMS source.
 
 ## Features
 
@@ -192,4 +192,4 @@ Each module follows a two-pass pattern mirroring GAMS phases:
 
 ## License
 
-See the RICE50x model [license](https://github.com/witch-team/RICE50xmodel/blob/master/LICENSE).
+This project is licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
