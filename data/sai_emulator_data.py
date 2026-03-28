@@ -1,5 +1,5 @@
 """
-Generate SAI g6 emulator data for PyRICE32.
+Generate SAI g6 emulator data for PyDICE32.
 
 The GAMS RICE50x model loads ``srm_temperature_response`` and
 ``srm_precip_response`` from a GDX file (data_mod_sai.gdx) that is not

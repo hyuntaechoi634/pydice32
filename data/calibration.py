@@ -1,5 +1,5 @@
 """
-Data loading and calibration for PyRICE 32.
+Data loading and calibration for PyDICE32.
 
 Extracts all data-loading and parameter-calibration logic from
 rice_gamspy.py (lines ~194-884) into a single ``load_and_calibrate(cfg)``
@@ -10,14 +10,14 @@ import os
 import math
 import numpy as np
 import pandas as pd
-from pyrice32.data.loader import load_csv, load_1d, load_validation_param
-from pyrice32.data.gcam_mapping import (
+from pydice32.data.loader import load_csv, load_1d, load_validation_param
+from pydice32.data.gcam_mapping import (
     load_rice_regions,
     load_gcam_mapping,
     load_gcam_region_names,
     aggregate_param_1d,
 )
-from pyrice32.data.sai_emulator_data import generate_sai_emulator_data, INJ_LABELS
+from pydice32.data.sai_emulator_data import generate_sai_emulator_data, INJ_LABELS
 
 
 def load_and_calibrate(cfg):
@@ -432,8 +432,9 @@ def load_and_calibrate(cfg):
     if os.path.exists(coef_file):
         cdf = pd.read_csv(coef_file)
         for _, row in cdf.iterrows():
-            n_val = str(row.iloc[0]).lower()
-            param = str(row.iloc[1]).lower()
+            # CSV columns: Dim1 (parameter name), n (ISO3 country), Val
+            param = str(row.iloc[0]).lower()
+            n_val = str(row.iloc[1]).lower()
             if n_val not in mapping:
                 continue
             rname = gcam_names[mapping[n_val]]

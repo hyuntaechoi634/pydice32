@@ -19,7 +19,7 @@ def print_results(m, rice, cfg, v, data):
     K = v["K"]
     S = v["S"]
 
-    print(f"\n=== PyRICE32 {policy.upper()} Results ({len(region_names)} regions, CONOPT) ===")
+    print(f"\n=== PyDICE32 {policy.upper()} Results ({len(region_names)} regions, CONOPT) ===")
     util_rec = UTILITY.records
     if util_rec is not None and len(util_rec) > 0:
         print(f"UTILITY: {util_rec['level'].iloc[0]:.6f}")

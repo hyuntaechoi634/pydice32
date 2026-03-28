@@ -682,7 +682,7 @@ def define_eqs(m, sets, params, cfg, v):
     )
     # SAI forcing offset (if active)
     if "W_SAI" in v:
-        import pyrice32.modules.mod_sai as _sai_mod
+        import pydice32.modules.mod_sai as _sai_mod
         geoeng_f = _sai_mod.GEOENG_FORCING
         if geoeng_f != 0.0:
             forc_rhs = forc_rhs + geoeng_f * v["W_SAI"][t_set]

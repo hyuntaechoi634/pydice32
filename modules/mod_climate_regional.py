@@ -47,9 +47,15 @@ def declare_vars(m, sets, params, cfg, v):
 
     # ------------------------------------------------------------------
     # Starting values
+    # Ideally these would be alpha_temp + beta_temp * TATM0 (absolute
+    # regional temperatures) as GAMS sets in before_solve.  But GAMSPy
+    # .l assignments don't support Parameter arithmetic, so we use the
+    # alpha_temp parameter alone (dominant term) as the starting hint.
+    # The equations will enforce the correct values regardless.
     # ------------------------------------------------------------------
-    TEMP_REGION.l[t_set, n_set] = TATM0
-    TEMP_REGION_DAM.l[t_set, n_set] = TATM0
+    par_alpha_temp = params["par_alpha_temp"]
+    TEMP_REGION.l[t_set, n_set] = par_alpha_temp[n_set]
+    TEMP_REGION_DAM.l[t_set, n_set] = par_alpha_temp[n_set]
 
     # Register in shared variable dict
     v["TEMP_REGION"] = TEMP_REGION

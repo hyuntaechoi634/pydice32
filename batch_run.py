@@ -1,6 +1,6 @@
 """
 Batch scenario runner: 5 policies × 2 damage functions × 3 MACC costs = 30 runs.
-Saves results to pyrice32/results/ as CSV files.
+Saves results to pydice32/results/ as CSV files.
 Tracks time, memory for each run.
 """
 
@@ -18,8 +18,8 @@ except ImportError:
     def get_mem_mb():
         return 0
 
-from pyrice32.config import Config
-from pyrice32.solver import build_model, solve_model
+from pydice32.config import Config
+from pydice32.solver import build_model, solve_model
 
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")

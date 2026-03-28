@@ -1,25 +1,25 @@
 """
-CLI entry point: python -m pyrice32 <policy> [options]
+CLI entry point: python -m pydice <policy> [options]
 
 Usage:
-    python -m pyrice32 bau --dice
-    python -m pyrice32 bau_impact --kalkuhl
-    python -m pyrice32 cba --dice
-    python -m pyrice32 cbudget --dice --cbudget=1150
-    python -m pyrice32 cbudget_regional --kalkuhl --burden=equal_per_capita
-    python -m pyrice32 cea_tatm --dice --tatm-limit=2.0
-    python -m pyrice32 cea_rcp --kalkuhl --forc-limit=4.5
-    python -m pyrice32 ctax --dice --ctax-initial=5 --ctax-slope=0.05
-    python -m pyrice32 global_netzero --dice --nz-year=2050
-    python -m pyrice32 long_term_pledges --kalkuhl
-    python -m pyrice32 simulation --dice
-    python -m pyrice32 cba --kalkuhl --macc=prob75
+    python -m pydice bau --dice
+    python -m pydice bau_impact --kalkuhl
+    python -m pydice cba --dice
+    python -m pydice cbudget --dice --cbudget=1150
+    python -m pydice cbudget_regional --kalkuhl --burden=equal_per_capita
+    python -m pydice cea_tatm --dice --tatm-limit=2.0
+    python -m pydice cea_rcp --kalkuhl --forc-limit=4.5
+    python -m pydice ctax --dice --ctax-initial=5 --ctax-slope=0.05
+    python -m pydice global_netzero --dice --nz-year=2050
+    python -m pydice long_term_pledges --kalkuhl
+    python -m pydice simulation --dice
+    python -m pydice cba --kalkuhl --macc=prob75
 """
 
 import sys
-from pyrice32.config import Config
-from pyrice32.solver import build_model, solve_model, solve_model_iterative, solve_model_nash
-from pyrice32.report import print_results
+from pydice32.config import Config
+from pydice32.solver import build_model, solve_model, solve_model_iterative, solve_model_nash
+from pydice32.report import print_results
 
 
 VALID_POLICIES = (

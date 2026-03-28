@@ -1,10 +1,10 @@
-# PyRICE 32
+# PyDICE3232
 
 Python/GAMSPy implementation of the [RICE50x](https://github.com/witch-team/RICE50xmodel) integrated assessment model with 32 GCAM regions.
 
 ## Overview
 
-PyRICE 32 translates the GAMS-based RICE50x model into a modular Python package using [GAMSPy](https://gamspy.readthedocs.io/). The model aggregates 155 ISO3 countries into 32 [GCAM](https://jgcri.github.io/gcam-doc/) regions and solves a Ramsey-type optimal growth model coupled with a climate system, damage functions, and abatement cost curves.
+PyDICE32 translates the GAMS-based RICE50x model into a modular Python package using [GAMSPy](https://gamspy.readthedocs.io/). The model aggregates 155 ISO3 countries into 32 [GCAM](https://jgcri.github.io/gcam-doc/) regions and solves a Ramsey-type optimal growth model coupled with a climate system, damage functions, and abatement cost curves.
 
 Modular architecture with ~110 equations verified against the native GAMS source.
 
@@ -75,16 +75,16 @@ CO2, CH4, N2O with species-specific:
 
 ### Setup
 ```bash
-conda create -n pyrice32 python=3.11
-conda activate pyrice32
+conda create -n pydice32 python=3.11
+conda activate pydice32
 pip install gamspy numpy pandas
 ```
 
 ### Data
-PyRICE 32 reads CSV data from the RICE50x model directory. Ensure this structure exists:
+PyDICE32 reads CSV data from the RICE50x model directory. Ensure this structure exists:
 ```
 rice-fund-gcam/
-├── pyrice32/              # this package
+├── pydice32/              # this package
 ├── RICE50xmodel/
 │   └── data_maxiso3_csv/  # CSV exports of GAMS GDX data
 └── gcam-core/
@@ -98,45 +98,45 @@ rice-fund-gcam/
 ### Command Line
 ```bash
 # Basic scenarios
-python -m pyrice32 bau --dice
-python -m pyrice32 cba --dice
-python -m pyrice32 cba --kalkuhl
+python -m pydice32 bau --dice
+python -m pydice32 cba --dice
+python -m pydice32 cba --kalkuhl
 
 # Carbon budget (2°C and 1.5°C)
-python -m pyrice32 cbudget --dice --cbudget=1150
-python -m pyrice32 cbudget --dice --cbudget=500
+python -m pydice32 cbudget --dice --cbudget=1150
+python -m pydice32 cbudget --dice --cbudget=500
 
 # Temperature ceiling
-python -m pyrice32 cea_tatm --dice --tatm-limit=2.0
+python -m pydice32 cea_tatm --dice --tatm-limit=2.0
 
 # Carbon tax
-python -m pyrice32 ctax --dice --ctax-initial=50 --ctax-slope=0.05
+python -m pydice32 ctax --dice --ctax-initial=50 --ctax-slope=0.05
 
 # Net-zero
-python -m pyrice32 global_netzero --dice --nz-year=2050
+python -m pydice32 global_netzero --dice --nz-year=2050
 
 # With options
-python -m pyrice32 cba --dice --prstp=0.03 --macc=prob75
+python -m pydice32 cba --dice --prstp=0.03 --macc=prob75
 
 # Iterative cooperative solve
-python -m pyrice32 cba --dice --iterative
+python -m pydice32 cba --dice --iterative
 
 # Nash non-cooperative
-python -m pyrice32 cba --dice --noncoop
+python -m pydice32 cba --dice --noncoop
 ```
 
 ### Batch Scenarios
 ```bash
 # Run 30 scenarios (5 policies × 2 damage functions × 3 MACC costs)
-python -m pyrice32.batch_run
+python -m pydice32.batch_run
 ```
-Results saved to `pyrice32/results/`.
+Results saved to `pydice32/results/`.
 
 ### Python API
 ```python
-from pyrice32.config import Config
-from pyrice32.solver import build_model, solve_model
-from pyrice32.report import print_results
+from pydice32.config import Config
+from pydice32.solver import build_model, solve_model
+from pydice32.report import print_results
 
 cfg = Config(policy="cba", impact="dice", PRSTP=0.015)
 m, rice, v, data = build_model(cfg)
@@ -147,7 +147,7 @@ print_results(m, rice, cfg, v, data)
 ## Architecture
 
 ```
-pyrice32/
+pydice32/
 ├── config.py                  # All parameters in one dataclass
 ├── solver.py                  # Model assembly + single-pass/iterative/Nash solve
 ├── report.py                  # Result extraction and printing

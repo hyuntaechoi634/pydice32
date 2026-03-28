@@ -132,7 +132,7 @@ def declare_vars(m, sets, params, cfg, v):
         ndc_file = os.path.join(cfg.data_dir, "data_pol_ndc", "pbl_cond_2030.csv")
         if os.path.exists(ndc_file):
             ndc_df = pd.read_csv(ndc_file)
-            from pyrice32.data.gcam_mapping import (
+            from pydice32.data.gcam_mapping import (
                 load_rice_regions, load_gcam_mapping, load_gcam_region_names,
             )
             rice_regions = load_rice_regions(cfg.project_root)

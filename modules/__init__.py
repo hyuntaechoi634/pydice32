@@ -1,5 +1,5 @@
 """
-PyRICE 32 modules -- each corresponds to a GAMS .gms module file.
+PyDICE32 modules -- each corresponds to a GAMS .gms module file.
 
 Each module exposes a ``define(m, sets, params, cfg, v)`` function:
   m      : GAMSPy Container
@@ -33,7 +33,7 @@ Optional extension modules (enabled via config flags):
   mod_slr              -- Sea-level rise (cfg.slr=True)
 """
 
-from pyrice32.modules import (
+from pydice32.modules import (
     core_economy,
     core_emissions,
     core_abatement,

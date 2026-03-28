@@ -1,5 +1,5 @@
 """
-Configuration and global parameters for PyRICE 32.
+Configuration and global parameters for PyDICE32.
 Corresponds to GAMS 'conf' and 'include_data' phases across all modules.
 """
 

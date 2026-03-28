@@ -29,15 +29,15 @@ from gamspy import (
     Container, Set, Alias, Parameter, Model, Sense, Options, Number,
     ModelStatus,
 )
-from pyrice32.config import Config
-from pyrice32.data import load_and_calibrate
-from pyrice32.modules import (
+from pydice32.config import Config
+from pydice32.data import load_and_calibrate
+from pydice32.modules import (
     core_economy, core_emissions, core_abatement, core_welfare,
     hub_climate, hub_impact, mod_impact_dice, mod_impact_kalkuhl,
     mod_impact_burke, mod_climate_regional, mod_climate_fair,
     mod_landuse, core_policy,
 )
-from pyrice32.modules import (
+from pydice32.modules import (
     mod_dac, mod_sai, mod_adaptation,
     mod_ocean, mod_natural_capital, mod_inequality, mod_labour, mod_slr,
 )
@@ -415,7 +415,7 @@ def _update_dac_learning(v, data, cfg):
            wcum_dac(tp1) = tlen(t) * sum(n, E_NEG.l(t,n)) + wcum_dac(t));
       dac_totcost(t,n) = max(dac_tot0*(wcum_dac(t)/wcum_dac('1'))^(-learn), floor);
     """
-    from pyrice32.modules.mod_dac import (
+    from pydice32.modules.mod_dac import (
         DAC_TOT0, DAC_TOTFLOOR, LEARN_RATES,
     )
 
@@ -1235,7 +1235,7 @@ def _create_parameters(m, sets, data, cfg):
     # D7: DAC total cost parameter (for iterative learning-curve updates)
     # Created unconditionally so _update_dac_learning can write back to it.
     if getattr(cfg, "dac", False):
-        from pyrice32.modules.mod_dac import DAC_TOT0
+        from pydice32.modules.mod_dac import DAC_TOT0
         dac_cost_records = [(str(t), r, DAC_TOT0)
                             for t in range(1, T + 1) for r in rn]
         p["par_dac_totcost"] = Parameter(
@@ -1421,7 +1421,7 @@ def _create_parameters(m, sets, data, cfg):
     # SAI g6 emulator parameters (when sai=True and sai_experiment="g6")
     # ------------------------------------------------------------------
     if getattr(cfg, "sai", False) and getattr(cfg, "sai_experiment", "g0") == "g6":
-        from pyrice32.modules.mod_sai import INJ_LABELS as _SAI_INJ
+        from pydice32.modules.mod_sai import INJ_LABELS as _SAI_INJ
         if "inj_set" not in sets:
             inj_set = Set(m, name="inj", records=_SAI_INJ,
                            description="possible injection points for SAI")
