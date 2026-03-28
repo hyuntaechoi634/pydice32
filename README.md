@@ -1,4 +1,4 @@
-# PyDICE3232
+# PyDICE32
 
 Python/GAMSPy implementation of the [RICE50x](https://github.com/witch-team/RICE50xmodel) integrated assessment model with 32 GCAM regions.
 
