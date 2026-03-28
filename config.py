@@ -96,7 +96,7 @@ class Config:
     # Abatement / MIU
     miu_inertia: float = 0.034      # per year (default RICE)
     max_miuup: float = 1.0          # MIU upper bound for CO2
-    tmiufix: tuple = (1, 2)         # periods where MIU is fixed
+    tmiufix: tuple = (1, 2, 3)      # periods where MIU is fixed (2015, 2020, 2025)
 
     # GHG species
     ghg_list: tuple = ("co2", "ch4", "n2o")
