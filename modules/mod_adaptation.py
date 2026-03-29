@@ -194,7 +194,10 @@ def define_eqs(m, sets, params, cfg, v):
     # eqq_act: Q_ADA('act',t,n) = eff * actc * (owa_rada * I_ADA('rada')^rho_act
     #                              + owa_prada * K_ADA('prada')^rho_act)^(1/rho_act)
     # ------------------------------------------------------------------
-    eff = DEFAULT_CES_ADA["eff"]
+    # GAMS: ces_ada('eff',n) varies by SSP: ssp2=1.0, ssp1/ssp5=1.25, ssp3=0.75
+    # Use SSP-dependent efficiency when available via config, otherwise default.
+    _ssp_eff = {"ssp1": 1.25, "ssp2": 1.0, "ssp3": 0.75, "ssp4": 1.0, "ssp5": 1.25}
+    eff = _ssp_eff.get(getattr(cfg, "SSP", "ssp2"), DEFAULT_CES_ADA["eff"])
     actc = DEFAULT_OWA["actc"]
     rho_act = DEFAULT_CES_ADA["act"]
     owa_rada = DEFAULT_OWA["rada"]

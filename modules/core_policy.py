@@ -150,10 +150,10 @@ def declare_vars(m, sets, params, cfg, v):
 
             for rname, ndc_val in ndc_by_region.items():
                 if ndc_val > 0:
-                    # Fix MIU for t=3 (2025) and t=4 (2030) -- GAMS default
-                    # ndcs_bound=".fx" means these are fixed, not lower bounds
-                    MIU.fx["3", rname, "co2"] = 0.5 * ndc_val
-                    MIU.fx["4", rname, "co2"] = ndc_val
+                    # GAMS: ndcs_bound defaults to ".lo" (lower bound), allowing
+                    # the optimizer to exceed NDC targets if beneficial.
+                    MIU.lo["3", rname, "co2"] = 0.5 * ndc_val
+                    MIU.lo["4", rname, "co2"] = ndc_val
 
 
 def define_eqs(m, sets, params, cfg, v):
@@ -304,16 +304,53 @@ def define_eqs(m, sets, params, cfg, v):
         v["par_ctax_corrected"] = par_ctax_corrected
 
         if cfg.ctax_marginal:
-            # ctax_marginal: fix MAC to ctax_corrected schedule
-            # GAMS: eq_ctax.. MAC(t,n,ghg) =E= ctax_corrected(t,n,ghg)
+            # ctax_marginal: fix CO2 MAC to ctax schedule.
+            # GAMS disables this by default (infeasibility risk), but for
+            # single-pass cooperative solve, fiscal revenue doesn't work
+            # (needs iterative E.l update).  Apply CO2-only to avoid
+            # non-CO2 MACC infeasibility.  Non-CO2 abatement is implicit
+            # via GWP-scaled carbon tax in the fiscal revenue term.
+            tmiufix_set = set(cfg.tmiufix)
+            # Compute cprice_max per (t, region) = MAC at MIU=maxmiu (CO2)
+            # GAMS: cprice_max(t,n,ghg) = c1*maxmiu^1 + c4*maxmiu^4
+            cprice_max_min = {}  # t -> min across regions of cprice_max
+            par_macc_c1 = params.get("par_macc_c1")
+            par_macc_c4 = params.get("par_macc_c4")
+            par_maxmiu = params.get("par_maxmiu_pbl")
+            if par_macc_c1 is not None and par_macc_c1.records is not None:
+                c1_df = par_macc_c1.records
+                c4_df = par_macc_c4.records if par_macc_c4 is not None else None
+                mu_df = par_maxmiu.records if par_maxmiu is not None else None
+                for _, row in c1_df[c1_df.iloc[:, 2] == "co2"].iterrows():
+                    t_s = str(row.iloc[0])
+                    n_s = str(row.iloc[1])
+                    c1_v = float(row["value"])
+                    c4_v = 0.0
+                    if c4_df is not None:
+                        c4r = c4_df[(c4_df.iloc[:,0]==t_s) & (c4_df.iloc[:,1]==n_s) & (c4_df.iloc[:,2]=="co2")]
+                        if len(c4r) > 0:
+                            c4_v = float(c4r["value"].iloc[0])
+                    mu = 1.0
+                    if mu_df is not None:
+                        mur = mu_df[(mu_df.iloc[:,0]==t_s) & (mu_df.iloc[:,1]==n_s) & (mu_df.iloc[:,2]=="co2")]
+                        if len(mur) > 0:
+                            mu = float(mur["value"].iloc[0])
+                    cp = c1_v * mu + c4_v * mu**4
+                    if t_s not in cprice_max_min or cp < cprice_max_min[t_s]:
+                        cprice_max_min[t_s] = cp
+
             ctax_sched_records = []
             for t in range(1, cfg.T + 1):
                 for ghg in cfg.ghg_list:
-                    tax = base_tax_records[t]
-                    # For marginal variant, use base tax (in T$/GtCO2)
-                    # with GWP applied
-                    ctax_sched_records.append((str(t), ghg,
-                                              tax * emi_gwp.get(ghg, 1.0)))
+                    # Only CO2, skip tmiufix periods
+                    if ghg != "co2" or t in tmiufix_set:
+                        ctax_sched_records.append((str(t), ghg, 0.0))
+                    else:
+                        # base_tax is in T$/GtCO2; GAMS: ctax_corrected = min(ctax*1e3, cprice_max)
+                        tax = base_tax_records[t] * 1e3
+                        cap = cprice_max_min.get(str(t), 1e6)
+                        tax = min(tax, cap * 0.95)  # 5% margin for solver
+                        ctax_sched_records.append((str(t), ghg, tax))
             par_ctax = Parameter(m, name="ctax_sched",
                                  domain=[t_set, ghg_set],
                                  records=ctax_sched_records)

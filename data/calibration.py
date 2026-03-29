@@ -148,16 +148,17 @@ def load_and_calibrate(cfg):
         if n in mapping
     }
 
-    k0_agg = aggregate_param_1d(
-        {n: v * (1.0 / max(ppp2mer_raw.get(n, 1.0), 1e-6))
-         for n, v in k0_raw.items()},
-        mapping, gcam_names,
-    )
-    # Impute missing: K = 2.72*GDP + 0.127 (R²=0.96), Koch & Marian (2021) RICE50x
-    # Linear regression of initial capital on GDP for regions with data.
-    for rname in region_names:
-        if k0_agg.get(rname, 0) == 0:
-            k0_agg[rname] = 2.72 * ykali_dict.get((1, rname), 0) + 0.127
+    # GAMS core_economy.gms line 151: impute missing k0 at COUNTRY level
+    # before aggregation: k0(n)$(k0(n) eq 0) = 2.72 * ykali('1',n) + 0.127
+    k0_ppp = {n: v * (1.0 / max(ppp2mer_raw.get(n, 1.0), 1e-6))
+              for n, v in k0_raw.items()}
+    for n in rice_regions_list:
+        if n in mapping and k0_ppp.get(n, 0) == 0:
+            # Get country-level GDP (PPP-adjusted) for imputation
+            country_gdp = gdp_weight.get(n, 0)
+            if country_gdp > 0:
+                k0_ppp[n] = 2.72 * country_gdp + 0.127
+    k0_agg = aggregate_param_1d(k0_ppp, mapping, gcam_names)
 
     s0_agg = aggregate_param_1d(
         {n: max(v, 1.0) / 100.0 for n, v in s0_raw.items()},
@@ -217,10 +218,11 @@ def load_and_calibrate(cfg):
     tempc_dict = {}
     for _, row in tempc_raw.iterrows():
         tempc_dict[str(row.iloc[0]).lower()] = row["Val"]
-    sigma1 = tempc_dict.get("sigma1", 0.1005)
-    lam = tempc_dict.get("lambda", 1.18)
-    sigma2 = tempc_dict.get("sigma2", 0.088)
-    heat_ocean = tempc_dict.get("heat_ocean", 0.025)
+    # Fallback values match RICE50x WITCH calibration (data_maxiso3/tempc.csv)
+    sigma1 = tempc_dict.get("sigma1", 0.37848906)
+    lam = tempc_dict.get("lambda", 1.36666667)
+    sigma2 = tempc_dict.get("sigma2", 0.36275881)
+    heat_ocean = tempc_dict.get("heat_ocean", 0.05748796)
 
     # Parse wcum0 (initial carbon stocks)
     wcum0 = np.zeros(3)
@@ -230,7 +232,8 @@ def load_and_calibrate(cfg):
             wcum0[layer_map[m_layer]] = row["Val"]
 
     # Parse radiative-forcing coefficients
-    rfc_alpha, rfc_beta = 5.35, 588.0
+    # Fallback values match RICE50x WITCH calibration (data_maxiso3/rfc.csv)
+    rfc_alpha, rfc_beta = 5.34196, 589.472
     for _, row in rfc_raw.iterrows():
         g, p_name = str(row.iloc[0]).lower(), str(row.iloc[1]).lower()
         if g == "co2" and p_name == "alpha":
@@ -387,7 +390,8 @@ def load_and_calibrate(cfg):
         lm_df = pd.read_csv(lu_macc_file)
         lu_c1_num = {}
         lu_c4_num = {}
-        lu_weights = {}
+        lu_c1_wgt = {}
+        lu_c4_wgt = {}
         for _, row in lm_df.iterrows():
             t_val = int(row.iloc[0])
             n_val = str(row.iloc[1]).lower()
@@ -402,20 +406,17 @@ def load_and_calibrate(cfg):
                 continue
             w = ykali_country.get((t_val, n_val), 0)
             key = (t_val, rname)
-            if key not in lu_weights:
-                lu_weights[key] = 0.0
-                lu_c1_num[key] = 0.0
-                lu_c4_num[key] = 0.0
             if coef == "c1":
-                lu_c1_num[key] += max(row["Val"], 0) * w
-                lu_weights[key] += w
+                lu_c1_num[key] = lu_c1_num.get(key, 0.0) + max(row["Val"], 0) * w
+                lu_c1_wgt[key] = lu_c1_wgt.get(key, 0.0) + w
             elif coef == "c4":
-                lu_c4_num[key] += max(row["Val"], 0) * w
-                # Don't double-count weights; only count on one coef type
-        for key in lu_weights:
-            if lu_weights[key] > 0:
-                lu_macc_c1_dict[key] = lu_c1_num.get(key, 0) / lu_weights[key]
-                lu_macc_c4_dict[key] = lu_c4_num.get(key, 0) / lu_weights[key]
+                lu_c4_num[key] = lu_c4_num.get(key, 0.0) + max(row["Val"], 0) * w
+                lu_c4_wgt[key] = lu_c4_wgt.get(key, 0.0) + w
+        for key in set(lu_c1_wgt) | set(lu_c4_wgt):
+            if lu_c1_wgt.get(key, 0) > 0:
+                lu_macc_c1_dict[key] = lu_c1_num.get(key, 0) / lu_c1_wgt[key]
+            if lu_c4_wgt.get(key, 0) > 0:
+                lu_macc_c4_dict[key] = lu_c4_num.get(key, 0) / lu_c4_wgt[key]
 
     # ------------------------------------------------------------------
     # Regional climate downscaling coefficients (population-weighted)
@@ -639,15 +640,16 @@ def load_and_calibrate(cfg):
                     macc_c4_dict[key] = c4_num.get(rname, 0) / c4_wgt[rname]
 
     # --- Non-CO2 MACC from PBL data ------------------------------------
+    # C1: Load raw per-country, apply mx backstop correction, then aggregate
+    # GAMS core_abatement.gms applies mx to ALL GHGs (CO2, CH4, N2O).
+    # For non-CO2: MXstart from data, MXpback = pbacktime / (MAC_at_maxmiu / emi_gwp(ghg))
     pbl_macc_file = os.path.join(
         data_dir, "data_mod_nonco2", "macc_ghg_coefficients.csv")
     if os.path.exists(pbl_macc_file):
         pbl_df = pd.read_csv(pbl_macc_file)
-        # Per-coef accumulators for GDP-weighted aggregation
-        pbl_c1_num = {}   # (t, rname, ghg) -> numerator
-        pbl_c4_num = {}
-        pbl_c1_wgt = {}   # (t, rname, ghg) -> weight
-        pbl_c4_wgt = {}
+        # First pass: collect raw per-country c1/c4 for non-CO2
+        pbl_c1_country = {}  # (t, iso, ghg) -> val
+        pbl_c4_country = {}
         for _, row in pbl_df.iterrows():
             t_val = int(row.iloc[0])
             n_val = str(row.iloc[1]).lower()
@@ -657,18 +659,59 @@ def load_and_calibrate(cfg):
                 continue
             if n_val not in mapping or t_val < 1 or t_val > T:
                 continue
-            rname = gcam_names[mapping[n_val]]
-            if rname not in region_names:
-                continue
-            w = ykali_country.get((t_val, n_val), 0)
             val = max(row["Val"], 0)
-            key = (t_val, rname, ghg)
             if coef == "c1":
-                pbl_c1_num[key] = pbl_c1_num.get(key, 0.0) + val * w
-                pbl_c1_wgt[key] = pbl_c1_wgt.get(key, 0.0) + w
+                pbl_c1_country[(t_val, n_val, ghg)] = val
             elif coef == "c4":
-                pbl_c4_num[key] = pbl_c4_num.get(key, 0.0) + val * w
-                pbl_c4_wgt[key] = pbl_c4_wgt.get(key, 0.0) + w
+                pbl_c4_country[(t_val, n_val, ghg)] = val
+
+        # Second pass: apply mx backstop correction per country
+        # GAMS: MXpback = pbacktime / ((c1*maxmiu + c4*maxmiu^4) / emi_gwp(ghg))
+        # For non-CO2, MXstart from mx_start_raw; default 1.0
+        pbl_c1_adj = {}  # (t, iso, ghg) -> mx-adjusted val
+        pbl_c4_adj = {}
+        for ghg in ("ch4", "n2o"):
+            gwp = emi_gwp.get(ghg, 25.0 if ghg == "ch4" else 298.0)
+            for t in range(1, T + 1):
+                for iso in rice_regions_list:
+                    c1_v = pbl_c1_country.get((t, iso, ghg), 0.0)
+                    c4_v = pbl_c4_country.get((t, iso, ghg), 0.0)
+                    # max_miu for non-CO2 varies; use 1.0 as default
+                    maxmiu_ghg = 1.0
+                    mac_at_max = c1_v * maxmiu_ghg + c4_v * maxmiu_ghg**4
+                    if mac_at_max > 0 and gwp > 0:
+                        MXpback = pbacktime[t] / (mac_at_max / gwp)
+                    else:
+                        MXpback = 0.0
+                    MXstart = mx_start_raw.get((t, iso), 1.0)
+                    MXdiff = max(MXstart - MXpback, 0.0)
+                    mx_val = MXstart - alpha_logistic[t] * MXdiff
+                    pbl_c1_adj[(t, iso, ghg)] = mx_val * c1_v
+                    pbl_c4_adj[(t, iso, ghg)] = mx_val * c4_v
+
+        # Third pass: GDP-weighted aggregation to 32 regions
+        pbl_c1_num = {}   # (t, rname, ghg) -> numerator
+        pbl_c4_num = {}
+        pbl_c1_wgt = {}   # (t, rname, ghg) -> weight
+        pbl_c4_wgt = {}
+        for ghg in ("ch4", "n2o"):
+            for t in range(1, T + 1):
+                for iso in rice_regions_list:
+                    if iso not in mapping:
+                        continue
+                    rname = gcam_names[mapping[iso]]
+                    if rname not in region_names:
+                        continue
+                    w = ykali_country.get((t, iso), 0)
+                    c1_v = pbl_c1_adj.get((t, iso, ghg), 0.0)
+                    c4_v = pbl_c4_adj.get((t, iso, ghg), 0.0)
+                    key = (t, rname, ghg)
+                    if c1_v > 0 or (t, iso, ghg) in pbl_c1_country:
+                        pbl_c1_num[key] = pbl_c1_num.get(key, 0.0) + c1_v * w
+                        pbl_c1_wgt[key] = pbl_c1_wgt.get(key, 0.0) + w
+                    if c4_v > 0 or (t, iso, ghg) in pbl_c4_country:
+                        pbl_c4_num[key] = pbl_c4_num.get(key, 0.0) + c4_v * w
+                        pbl_c4_wgt[key] = pbl_c4_wgt.get(key, 0.0) + w
         for key in pbl_c1_wgt:
             if pbl_c1_wgt[key] > 0:
                 macc_c1_dict[key] = pbl_c1_num[key] / pbl_c1_wgt[key]

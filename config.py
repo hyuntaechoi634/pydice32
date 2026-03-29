@@ -54,8 +54,8 @@ class Config:
     ctax_start: int = 2025          # year tax begins
     ctax_slope: float = 0.05        # annual growth rate
     ctax_shape: str = "exponential" # exponential (only option for now)
-    ctax_marginal: bool = True      # True = MAC-fixing approach (ctax_marginal variant);
-                                    # False = fiscal revenue approach (ctax_corrected in eq_yy)
+    ctax_marginal: bool = True      # True = MAC-fixing (CO2-only, simpler than GAMS fiscal approach).
+                                    # GAMS uses fiscal revenue (iterative), but single-pass needs MAC-fix.
 
     # Net-zero (global_netzero policy)
     nz_year: int = 2050             # year global net-zero CO2 is enforced
@@ -184,6 +184,11 @@ class Config:
         if self.impact == "":
             self.impact = policy_impact_defaults.get(self.policy, "kalkuhl")
         # If user explicitly set it (non-empty), respect their choice
+
+        # GAMS mod_impact_burke.gms line 28: "$setglobal damage_cap"
+        # Burke's extreme impact functions require damage cap by default.
+        if self.impact == "burke":
+            self.damage_cap = True
 
         # Issue 1: cea_tatm and cea_rcp auto-set damages_postprocessed
         if self.policy in ("cea_tatm", "cea_rcp"):

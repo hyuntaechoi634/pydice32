@@ -49,6 +49,9 @@ def declare_vars(m, sets, params, cfg, v):
     # Bounds and starting values
     # ------------------------------------------------------------------
     OMEGA.l[t_set, n_set] = 0
+    # GAMS hub_impact.gms line 66: OMEGA.lo = (-1 + 1e-5) only for full omega
+    if getattr(cfg, "omega_eq", "simple") == "full":
+        OMEGA.lo[t_set, n_set] = -1 + 1e-5
     OMEGA.fx["1", n_set] = 0
     DAMFRAC_UNBOUNDED.l[t_set, n_set] = 0
     DAMFRAC_UNBOUNDED.fx["1", n_set] = 0

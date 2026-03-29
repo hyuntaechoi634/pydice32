@@ -124,6 +124,41 @@ def declare_vars(m, sets, params, cfg, v):
     # Bounds -- GAMS: E_NEG.lo = 1e-15, stability
     E_NEG.lo[t_set, n_set] = 1e-15
 
+    # GAMS: I_CDR.up = 30 / c2co2  (investment upper bound)
+    I_CDR.up[t_set, n_set] = 30.0 / CtoCO2
+
+    # GAMS: E_NEG.up based on regional share of global MAX_CDR.
+    # Uses population-based burden sharing (GAMS line 158):
+    #   E_NEG.up(t,n) = pop('2',n)/sum(nn,pop('2',nn)) * totcapstor/5697 * max_cdr
+    # Simplified: use pop share * MAX_CDR as upper bound (totcapstor/5697 ≈ 1).
+    par_pop = params["par_pop"]
+    pop_records = par_pop.records
+    if pop_records is not None and not pop_records.empty:
+        pop_t2 = pop_records[pop_records.iloc[:, 0] == "2"]
+        if not pop_t2.empty:
+            total_pop = pop_t2["value"].sum()
+            for _, row in pop_t2.iterrows():
+                region = row.iloc[1]
+                share = row["value"] / total_pop if total_pop > 0 else 0
+                E_NEG.up[t_set, region] = share * MAX_CDR
+        else:
+            # Fallback: equal share
+            n_regions = len(n_set.records) if n_set.records is not None else 32
+            E_NEG.up[t_set, n_set] = MAX_CDR / n_regions
+    else:
+        n_regions = len(n_set.records) if n_set.records is not None else 32
+        E_NEG.up[t_set, n_set] = MAX_CDR / n_regions
+
+    # GAMS: I_CDR.up(t,n)$(year(t) gt 2100) = 0  (no investment after 2100)
+    # period 18 = year 2100; periods 19+ = year > 2100
+    T = cfg.T
+    for t_idx in range(19, T + 1):
+        I_CDR.up[str(t_idx), n_set] = 0
+
+    # GAMS: E_NEG.up(t,n)$(year(t) le 2020) = small value (early-period cap)
+    # periods 1 and 2 correspond to 2015, 2020
+    E_NEG.up["2", n_set] = 1e-3
+
     # GAMS: COST_CDR.up = 0.25 * ykali for stability
     par_ykali = params["par_ykali"]
     COST_CDR.up[t_set, n_set] = 0.25 * par_ykali[t_set, n_set]
@@ -164,9 +199,20 @@ def define_eqs(m, sets, params, cfg, v):
     dac_growth_scenario = getattr(cfg, "dac_growth", "medium")
     mkt_growth_rate = GROWTH_RATES.get(dac_growth_scenario, GROWTH_RATES["medium"])
 
-    # Use initial cost (learning is iterated externally in before_solve in GAMS;
-    # here we use the initial cost as a constant approximation for the NLP).
-    dac_totcost = DAC_TOT0
+    # DAC total cost: use GAMSPy parameter so the iterative solver can update
+    # it via the learning curve in before_solve (mirrors GAMS mod_dac.gms).
+    # In single-pass mode, the parameter holds the initial cost DAC_TOT0.
+    par_dac_totcost = params.get("par_dac_totcost")
+    if par_dac_totcost is not None:
+        dac_totcost = par_dac_totcost[t_set, n_set]
+        # For inv_factor, use initial cost as a constant (learning updates
+        # the cost parameter between solves, but inv_factor in capacity
+        # accumulation uses the *current* cost which varies by period).
+        # This matches GAMS: I_CDR(t,n) / (capex * lifetime * dac_totcost(t,n))
+        inv_factor_expr = 1.0 / (CAPEX * LIFETIME) / dac_totcost
+    else:
+        dac_totcost = DAC_TOT0
+        inv_factor_expr = 1.0 / (CAPEX * LIFETIME * dac_totcost)
 
     # CCS storage cost: load from data or use default
     # GAMS mod_dac.gms line 213: + sum(ccs_stor, E_STOR * ccs_stor_cost) * CtoCO2
@@ -182,13 +228,12 @@ def define_eqs(m, sets, params, cfg, v):
     equations = []
 
     # eq_depr_e_neg: capacity accumulation / depreciation
-    # E_NEG(t+1) = E_NEG(t) * (1 - delta)^tstep + tstep * I_CDR(t) / (capex * lifetime * dac_totcost)
+    # E_NEG(t+1) = E_NEG(t) * (1 - delta)^tstep + tstep * I_CDR(t) / (capex * lifetime * dac_totcost(t,n))
     eq_depr_e_neg = Equation(m, name="eq_depr_e_neg", domain=[t_set, n_set])
-    inv_factor = 1.0 / (CAPEX * LIFETIME * dac_totcost)
     eq_depr_e_neg[t_set, n_set].where[Ord(t_set) < Card(t_set)] = (
         E_NEG[t_set.lead(1), n_set]
         == E_NEG[t_set, n_set] * (1 - delta_en) ** TSTEP
-        + TSTEP * I_CDR[t_set, n_set] * inv_factor
+        + TSTEP * I_CDR[t_set, n_set] * inv_factor_expr
     )
     equations.append(eq_depr_e_neg)
 
@@ -202,17 +247,27 @@ def define_eqs(m, sets, params, cfg, v):
     eq_cost_cdr[t_set, n_set] = (
         COST_CDR[t_set, n_set]
         == I_CDR[t_set, n_set]
-        + E_NEG[t_set, n_set] * dac_totcost * (1 - CAPEX)
+        + E_NEG[t_set, n_set] * dac_totcost * (1.0 - CAPEX)
         + E_NEG[t_set, n_set] * avg_ccs_stor_cost
     )
     equations.append(eq_cost_cdr)
 
     # eq_mkt_growth_dac: growth constraint
-    # I_CDR(t+1) / factor <= I_CDR(t) / factor * (1+growth)^tstep + tstep * free_growth
+    # GAMS: I_CDR(tp1)/(capex*lifetime*dac_totcost(tp1))
+    #        <= I_CDR(t)/(capex*lifetime*dac_totcost(t)) * (1+growth)^tstep
+    #        + tstep * free_growth
+    # LHS uses dac_totcost(t+1), RHS uses dac_totcost(t).
     eq_mkt_growth_dac = Equation(m, name="eq_mkt_growth_dac", domain=[t_set, n_set])
+    if par_dac_totcost is not None:
+        # Time-varying cost: LHS needs cost at t+1, RHS needs cost at t
+        inv_lhs = 1.0 / (CAPEX * LIFETIME) / par_dac_totcost[t_set.lead(1), n_set]
+        inv_rhs = 1.0 / (CAPEX * LIFETIME) / par_dac_totcost[t_set, n_set]
+    else:
+        inv_lhs = inv_factor_expr
+        inv_rhs = inv_factor_expr
     eq_mkt_growth_dac[t_set, n_set].where[Ord(t_set) < Card(t_set)] = (
-        I_CDR[t_set.lead(1), n_set] * inv_factor
-        <= I_CDR[t_set, n_set] * inv_factor * (1 + mkt_growth_rate) ** TSTEP
+        I_CDR[t_set.lead(1), n_set] * inv_lhs
+        <= I_CDR[t_set, n_set] * inv_rhs * (1 + mkt_growth_rate) ** TSTEP
         + TSTEP * MKT_GROWTH_FREE
     )
     equations.append(eq_mkt_growth_dac)

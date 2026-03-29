@@ -79,10 +79,12 @@ def define_eqs(m, sets, params, cfg, v):
     # MIU upper bounds for non-CO2 (GAMS core_abatement.gms compute_vars)
     # GAMS: MIU.up(t,n,ghg)$(not tmiufix(t) and not sameas(ghg,'co2')) = maxmiu_pbl(t,n,ghg)
     # For non-CO2 GHGs, override MIU.up with species-specific max from PBL data.
-    # We apply this for ghg_set elements 2+ (ch4, n2o). For tmiufix periods,
-    # MIU is already fixed to 0 in core_policy, so the .up doesn't matter.
+    # Skip for bau/bau_impact/simulation where MIU is fixed to 0 in core_policy,
+    # because setting .up here (in define_eqs, Pass 2) would override the .fx
+    # set in declare_vars (Pass 1).
     # ------------------------------------------------------------------
-    MIU.up[t_set, n_set, ghg_set] = par_maxmiu_pbl[t_set, n_set, ghg_set]
+    if cfg.policy not in ("bau", "bau_impact", "simulation"):
+        MIU.up[t_set, n_set, ghg_set] = par_maxmiu_pbl[t_set, n_set, ghg_set]
 
     # ------------------------------------------------------------------
     # Equations

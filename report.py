@@ -86,15 +86,27 @@ def _print_scc(m, v):
             print("\nSocial Cost of Carbon (SCC) [$/tCO2]:")
             for yr_idx, yr in [(1, 2015), (4, 2030), (8, 2050), (18, 2100)]:
                 t_str = str(yr_idx)
-                e_marg = eq_e_rec[eq_e_rec["t"] == t_str]["marginal"].values
+                # Filter by CO2 only -- SCC is the shadow price of the CO2
+                # emissions constraint, not the sum across all GHGs.
+                e_co2 = eq_e_rec[(eq_e_rec["t"] == t_str) & (eq_e_rec["ghg"] == "co2")]
+                e_marg = e_co2["marginal"].values
                 cc_marg = eq_cc_rec[eq_cc_rec["t"] == t_str]["marginal"].values
                 if len(e_marg) > 0 and len(cc_marg) > 0:
-                    sum_e_m = e_marg.sum()
-                    sum_cc_m = cc_marg.sum()
-                    scc = -1e3 * sum_e_m / sum_cc_m if abs(sum_cc_m) > 1e-20 else 0
+                    # GAMS: scc = -1e3 * sum(nn, eq_e.m(t,nn,ghg) / eq_cc.m(t,nn))
+                    # Sum of per-region ratios, NOT ratio of sums.
+                    scc = 0.0
+                    cc_by_region = {
+                        row["n"]: row["marginal"]
+                        for _, row in eq_cc_rec[eq_cc_rec["t"] == t_str].iterrows()
+                    }
+                    for _, row in e_co2.iterrows():
+                        cc_m = cc_by_region.get(row["n"], 0.0)
+                        if abs(cc_m) > 1e-20:
+                            scc += row["marginal"] / cc_m
+                    scc *= -1e3
                     print(f"  {yr}: SCC={scc:.2f} $/tCO2")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"\n  [SCC computation failed: {exc}]")
 
 
 def _print_cba_diagnostics(v):

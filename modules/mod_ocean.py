@@ -241,8 +241,19 @@ def define_eqs(m, sets, params, cfg, v):
 
     # ------------------------------------------------------------------
     # 1. eq_ocean_area: OCEAN_AREA = area_start * (1 + coef*dT + coef_sq*dT^2)
-    # GAMS: eq_ocean_area(oc_capital,t,n)$(reg(n) and ocean_area_start(oc_capital,n))
+    # GAMS: uses TATM.l(t) (fixed level, NOT endogenous) to decouple ocean
+    # area from the optimizer. We use par_tatm_level (a Parameter updated
+    # between iterations in _before_solve) instead of the TATM Variable.
     # ------------------------------------------------------------------
+    # Create a parameter to hold TATM level values (updated iteratively)
+    par_tatm_level = params.get("par_tatm_level")
+    if par_tatm_level is None:
+        # Initialize from TATM starting levels
+        tatm_recs = [(str(t), TATM0) for t in range(1, cfg.T + 1)]
+        par_tatm_level = Parameter(m, name="tatm_level", domain=[t_set],
+                                   records=tatm_recs)
+        params["par_tatm_level"] = par_tatm_level
+
     eq_ocean_area = Equation(m, name="eq_ocean_area",
                              domain=[oc_capital, t_set, n_set])
     eq_ocean_area[oc_capital, t_set, n_set].where[
@@ -250,10 +261,13 @@ def define_eqs(m, sets, params, cfg, v):
     ] = (
         OCEAN_AREA[oc_capital, t_set, n_set] ==
         par_area_start[oc_capital, n_set]
-        * (1 + par_area_dam[oc_capital, n_set] * (TATM[t_set] - TATM0)
-           + par_area_dam_sq[oc_capital, n_set] * (TATM[t_set] - TATM0) ** 2)
+        * (1 + par_area_dam[oc_capital, n_set] * (par_tatm_level[t_set] - TATM0)
+           + par_area_dam_sq[oc_capital, n_set] * (par_tatm_level[t_set] - TATM0) ** 2)
     )
     equations.append(eq_ocean_area)
+
+    # GAMS: TATM.lo(t) = TATM.l('1') -- prevent temperature below initial
+    TATM.lo[t_set] = TATM0
 
     # ------------------------------------------------------------------
     # 2. eq_ocean_cpc: CPC with ocean consumption damages
@@ -274,13 +288,24 @@ def define_eqs(m, sets, params, cfg, v):
     # GAMS: VSL(t,n) = vsl_start * (global_gdppc(1)/US_gdppc(1))
     #                            * (global_gdppc(t)/global_gdppc(1))
     # ------------------------------------------------------------------
+    # GAMS: VSL = vsl_start * (global_gdppc_1 / US_gdppc_1) * (global_gdppc_t / global_gdppc_1)
+    #      = vsl_start * global_gdppc_t / US_gdppc_1
+    # The US GDP per capita normalization is needed because VSL_START is
+    # calibrated to the US. Load US region GDP per capita at t=1 from data.
+    us_gdppc_1 = params.get("par_us_gdppc_1")
+    if us_gdppc_1 is not None:
+        us_denom = us_gdppc_1
+    else:
+        # Fallback: use global average (original Python behavior)
+        us_denom = (Sum(n_alias, par_ykali["1", n_alias])
+                    / Sum(n_alias, par_pop["1", n_alias]))
+
     eq_ocean_vsl = Equation(m, name="eq_ocean_vsl", domain=[t_set, n_set])
     eq_ocean_vsl[t_set, n_set] = (
         VSL[t_set, n_set] == VSL_START
         * (Sum(n_alias, par_ykali[t_set, n_alias])
            / Sum(n_alias, par_pop[t_set, n_alias]))
-        / (Sum(n_alias, par_ykali["1", n_alias])
-           / Sum(n_alias, par_pop["1", n_alias]))
+        / us_denom
     )
     equations.append(eq_ocean_vsl)
 

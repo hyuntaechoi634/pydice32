@@ -289,4 +289,25 @@ def define_eqs(m, sets, params, cfg, v):
     )
     equations.append(eq_transfer)
 
+    # ------------------------------------------------------------------
+    # eq_utarg: GAMS welfare_inequality -- replace UTARG = CPC with
+    # Atkinson inequality-averse mean across deciles:
+    # UTARG(t,n) = [sum(dist, quant_share * CPC_DIST^(1-gammaint))]^(1/(1-gammaint))
+    # ------------------------------------------------------------------
+    welfare_inequality = getattr(cfg, "welfare_inequality", True)
+    if welfare_inequality and "UTARG" in v:
+        UTARG = v["UTARG"]
+        gammaint = GAMMAINT  # 0.50
+        # quant_share = 1/card(dist) = 0.1 for deciles
+        quant_share = 1.0 / 10.0
+
+        eq_utarg = Equation(m, name="eq_utarg", domain=[t_set, n_set])
+        eq_utarg[t_set, n_set] = (
+            UTARG[t_set, n_set] ==
+            (Sum(dist_set,
+                 quant_share * CPC_DIST[t_set, n_set, dist_set] ** (1 - gammaint))
+            ) ** (1.0 / (1 - gammaint))
+        )
+        equations.append(eq_utarg)
+
     return equations

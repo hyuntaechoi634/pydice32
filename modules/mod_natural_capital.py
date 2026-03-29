@@ -280,4 +280,28 @@ def define_eqs(m, sets, params, cfg, v):
         )
     equations.append(eq_gnn)
 
+    # ------------------------------------------------------------------
+    # eq_utarg: GAMS nat_cap_utility -- replace UTARG = CPC with CES
+    # UTARG(t,n) = [(1-share)*CPC^theta + share*(NAT_CAP_DAM('nonmarket')/pop*1e6)^theta]^(1/theta)
+    # Only when natural capital utility integration is active.
+    # ------------------------------------------------------------------
+    nat_cap_utility = getattr(cfg, "nat_cap_utility", True)
+    if nat_cap_utility and "UTARG" in v and "CPC" in v:
+        from gamspy.math import log as glog  # noqa: avoid unused import if not needed
+        CPC = v["CPC"]
+        UTARG = v["UTARG"]
+        par_pop = params["par_pop"]
+        theta = THETA   # 0.58
+        share = NAT_CAP_UTILITY_SHARE  # 0.10
+
+        eq_utarg = Equation(m, name="eq_utarg", domain=[t_set, n_set])
+        eq_utarg[t_set, n_set] = (
+            UTARG[t_set, n_set] ==
+            ((1 - share) * CPC[t_set, n_set] ** theta
+             + share * (NAT_CAP_DAM["nonmarket", t_set, n_set]
+                        / par_pop[t_set, n_set] * 1e6) ** theta
+            ) ** (1.0 / theta)
+        )
+        equations.append(eq_utarg)
+
     return equations

@@ -151,7 +151,8 @@ def solve_model_iterative(m, rice, v, data, cfg):
     region_names = data["region_names"]
     T = cfg.T
 
-    # D12: Build tracked_vars list dynamically based on active modules
+    # GAMS vcheck: base {MIU, S, Y, TATM} + module additions (E_NEG, MIULAND, SAI).
+    # All variables in vcheck gate convergence (not just monitoring).
     tracked_vars = ["MIU", "S", "Y", "TATM"]
     if cfg.dac and "E_NEG" in v:
         tracked_vars.append("E_NEG")
@@ -207,7 +208,7 @@ def solve_model_iterative(m, rice, v, data, cfg):
             allerr = _compute_errors(current, prev_values, tracked_vars, cfg)
             _print_errors(allerr, iteration)
 
-            # D3: Only declare convergence when solution is also optimal
+            # Gate on ALL tracked_vars (GAMS vcheck includes module additions)
             if iteration >= min_iter and is_optimal:
                 if all(allerr.get(vn, 1.0) < tolerances.get(vn, tol)
                        for vn in tracked_vars):
@@ -269,7 +270,7 @@ def solve_model_nash(m, rice, v, data, cfg):
     coalitions = data.get("coalitions",
                           [[r] for r in region_names])
 
-    # D12: Build tracked_vars dynamically based on active modules
+    # GAMS vcheck: base {MIU, S, Y, TATM} + module additions (E_NEG, MIULAND, SAI).
     tracked_vars = ["MIU", "S", "Y", "TATM"]
     if cfg.dac and "E_NEG" in v:
         tracked_vars.append("E_NEG")
@@ -301,7 +302,7 @@ def solve_model_nash(m, rice, v, data, cfg):
         # information from previously-solved coalitions within the same
         # iteration.  This typically converges faster than the simultaneous
         # (Jacobi) alternative and is used in the reference GAMS RICE model.
-        last_status = None
+        all_optimal = True
         for clt_idx, clt in enumerate(coalitions):
             clt_regions = set(clt)
             other_regions = [r for r in region_names if r not in clt_regions]
@@ -313,15 +314,22 @@ def solve_model_nash(m, rice, v, data, cfg):
                   f"{clt}")
             rice.solve(solver="conopt",
                        options=Options(iteration_limit=99900))
-            last_status = rice.status
+            clt_status = rice.status
 
             # D2: Retry once if infeasible
-            if last_status in (ModelStatus.InfeasibleGlobal,
-                               ModelStatus.InfeasibleLocal):
+            if clt_status in (ModelStatus.InfeasibleGlobal,
+                              ModelStatus.InfeasibleLocal):
                 print("    Infeasible -- retrying...")
                 rice.solve(solver="conopt",
                            options=Options(iteration_limit=99900))
-                last_status = rice.status
+                clt_status = rice.status
+
+            # Track optimality across ALL coalitions (not just the last one)
+            if clt_status not in (ModelStatus.OptimalGlobal,
+                                  ModelStatus.OptimalLocal,
+                                  ModelStatus.Feasible):
+                all_optimal = False
+                print(f"    WARNING: coalition {clt} status = {clt_status}")
 
             if other_regions:
                 _unfix_other_regions(v, other_regions, cfg)
@@ -329,11 +337,8 @@ def solve_model_nash(m, rice, v, data, cfg):
         # after_solve phase (climate propagation, tracking)
         _after_solve(m, v, data, cfg, iteration)
 
-        # D3: Track optimality for convergence gating
-        is_optimal = last_status in (
-            ModelStatus.OptimalGlobal, ModelStatus.OptimalLocal,
-            ModelStatus.Feasible,
-        ) if last_status is not None else False
+        # D3: Track optimality for convergence gating (all coalitions must be optimal)
+        is_optimal = all_optimal
 
         # Snapshot and convergence
         current = _snapshot(v, data, cfg, tracked_vars)
@@ -344,7 +349,7 @@ def solve_model_nash(m, rice, v, data, cfg):
             allerr = _compute_errors(current, prev_values, tracked_vars, cfg)
             _print_errors(allerr, iteration)
 
-            # D3: Only declare convergence when solution is also optimal
+            # Gate on ALL tracked_vars (GAMS vcheck includes module additions)
             if iteration >= min_iter and is_optimal:
                 if all(allerr.get(vn, 1.0) < tolerances.get(vn, tol)
                        for vn in tracked_vars):
@@ -472,10 +477,11 @@ def _update_dac_learning(v, data, cfg):
 
 
 def _update_savings_terminal(v, data, cfg):
-    """Fix savings rate for last 10 periods to S.l('48',n).
+    """Fix savings rate for last 10 periods to S.l(T-10, n).
 
     GAMS core_economy.gms before_solve:
       S.fx(t,n)$(tperiod(t) gt (smax(tt,tperiod(tt)) - 10)) = S.l('48',n)
+    H1: Use T-10 dynamically instead of hardcoded '48' so this works for any T.
     """
     T = cfg.T
     S = v["S"]
@@ -485,20 +491,21 @@ def _update_savings_terminal(v, data, cfg):
     if s_recs is None or len(s_recs) == 0:
         return
 
-    # Get S.l('48', n) for each region
-    s48 = {}
+    # Get S.l(T-10, n) for each region (period 48 when T=58)
+    ref_period = str(T - 10)
+    s_ref = {}
     for _, row in s_recs.iterrows():
-        if str(row.iloc[0]) == "48":
-            s48[str(row.iloc[1])] = row["level"]
+        if str(row.iloc[0]) == ref_period:
+            s_ref[str(row.iloc[1])] = row["level"]
 
-    if not s48:
+    if not s_ref:
         return
 
-    # Fix S for t > T - 10 (i.e., t >= 49 when T=58)
+    # Fix S for t > T - 10 (i.e., t >= T-9)
     for t in range(T - 10 + 1, T + 1):
         for r in region_names:
-            if r in s48:
-                S.fx[str(t), r] = s48[r]
+            if r in s_ref:
+                S.fx[str(t), r] = s_ref[r]
 
 
 def _update_cprice_max(v, data, cfg):
@@ -560,6 +567,15 @@ def _update_temp_region_levels(v, data):
             beta = beta_temp.get(r, 1.0)
             TEMP_REGION.l[t_str, r] = alpha + beta * tatm_val
 
+    # Update par_tatm_level parameter for ocean module (GAMS: TATM.l pattern)
+    # This parameter is used by eq_ocean_area to decouple area from optimizer.
+    par_tatm_level = data.get("_params", {}).get("par_tatm_level")
+    if par_tatm_level is not None:
+        T = data.get("T", len(tatm_levels))
+        par_tatm_level.setRecords(
+            [(t_str, tatm_levels.get(t_str, 1.1)) for t_str in tatm_levels]
+        )
+
 
 # ---------------------------------------------------------------------------
 #  Internal: after_solve callbacks
@@ -577,7 +593,9 @@ def _after_solve(m, v, data, cfg, iteration):
     emission levels to ensure global temperature is consistent after the
     sequential coalition solves.
     """
-    if cfg.cooperation != "coop":
+    # H3: Only propagate climate in Nash modes where coalitions solve
+    # separately.  In coop/coop_iterative the NLP already ensures consistency.
+    if cfg.cooperation not in ("coop", "coop_iterative"):
         _propagate_climate(m, v, data, cfg)
 
     # Update TEMP_REGION.l for solver hints in the next iteration
@@ -597,19 +615,9 @@ def _propagate_climate(m, v, data, cfg):
     levels.  This updates the .l (level) values of WCUM_EMI, TATM, TOCEAN
     so the next iteration's NLP starts from a consistent climate state.
     """
-    # FAIR climate uses a fundamentally different carbon cycle (4-box CO2,
-    # IRF100 feedback) that cannot be forward-propagated with the simple
-    # witchco2 transfer matrix.  Warn and skip for FAIR+Nash.
-    if cfg.climate == "fair" and cfg.cooperation != "coop":
-        import warnings
-        warnings.warn(
-            "Climate propagation in Nash/non-cooperative mode is only "
-            "implemented for the witchco2 climate module. FAIR climate "
-            "propagation is not available; the NLP equations will maintain "
-            "climate consistency within each coalition solve, but inter-"
-            "coalition consistency may be approximate.",
-            UserWarning,
-        )
+    # Dispatch to appropriate climate propagation
+    if cfg.climate == "fair":
+        _propagate_climate_fair(m, v, data, cfg)
         return
 
     T = cfg.T
@@ -630,10 +638,11 @@ def _propagate_climate(m, v, data, cfg):
     heat_ocean = params.get("par_heat_ocean")
 
     # Read raw scalars for forward calculation
-    sigma1_val = data.get("sigma1", 0.024)
-    lam_val = data.get("lam", 1.13)
-    sigma2_val = data.get("sigma2", 0.44)
-    heat_ocean_val = data.get("heat_ocean", 0.024)
+    # Fallback values match RICE50x WITCH calibration (data_maxiso3/tempc.csv)
+    sigma1_val = data.get("sigma1", 0.37848906)
+    lam_val = data.get("lam", 1.36666667)
+    sigma2_val = data.get("sigma2", 0.36275881)
+    heat_ocean_val = data.get("heat_ocean", 0.05748796)
 
     # Read carbon cycle transfer matrix
     cmphi = data.get("cmphi")
@@ -683,11 +692,271 @@ def _propagate_climate(m, v, data, cfg):
                 val += TSTEP * w_emi_levels.get(t_str, 0.0)
             wcum_levels[(layer, tp1_str)] = max(val, 0.0001)
 
-    # Note: Temperature forward propagation requires FORC which depends on
-    # RF_CO2 = rfc_alpha * (log(WCUM_atm) - log(rfc_beta)).  For simplicity,
-    # we rely on the NLP equations to maintain temperature consistency and
-    # only update WCUM levels here.  The TATM and TOCEAN .l values from the
-    # last coalition solve are already reasonable starting points.
+    # Temperature forward propagation: compute FORC from WCUM then update
+    # TATM and TOCEAN using the DICE two-box energy balance model.
+    rfc_alpha_val = data.get("rfc_alpha", 3.68)
+    rfc_beta_val = data.get("rfc_beta", 588.0)
+    oghg_intercept = data.get("oghg_intercept", 0.5)
+    oghg_slope = data.get("oghg_slope", 0.0)
+
+    for t in range(1, T):
+        t_str = str(t)
+        tp1_str = str(t + 1)
+
+        # RF_CO2 = rfc_alpha * (log(WCUM_atm) - log(rfc_beta))
+        wcum_atm = max(wcum_levels.get(("atm", t_str), 851.0), 1e-6)
+        rf_co2 = rfc_alpha_val * (math.log(wcum_atm) - math.log(rfc_beta_val))
+
+        # RFoth = oghg_intercept + oghg_slope * RF_CO2
+        rfoth = oghg_intercept + oghg_slope * rf_co2
+
+        # FORC = RF_CO2 + RFoth
+        forc = rf_co2 + rfoth
+
+        tatm_t = tatm_levels.get(t_str, 1.1)
+        tocean_t = tocean_levels.get(t_str, 0.11)
+
+        # TATM(t+1) = TATM(t) + sigma1*(FORC - lambda*TATM - sigma2*(TATM-TOCEAN))
+        tatm_tp1 = tatm_t + sigma1_val * (
+            forc - lam_val * tatm_t - sigma2_val * (tatm_t - tocean_t))
+        # TOCEAN(t+1) = TOCEAN(t) + heat_ocean*(TATM-TOCEAN)
+        tocean_tp1 = tocean_t + heat_ocean_val * (tatm_t - tocean_t)
+
+        tatm_levels[tp1_str] = tatm_tp1
+        tocean_levels[tp1_str] = tocean_tp1
+
+    # Write updated levels back to GAMSPy variables
+    wcum_records = [(layer, str(t), max(wcum_levels.get((layer, str(t)), 0.0001), 0.0001))
+                    for layer in layer_names for t in range(1, T + 1)]
+    WCUM_EMI.setRecords(wcum_records)
+
+    tatm_records = [(str(t), tatm_levels.get(str(t), 1.1))
+                    for t in range(1, T + 1)]
+    TATM.setRecords(tatm_records)
+
+    tocean_records = [(str(t), tocean_levels.get(str(t), 0.11))
+                      for t in range(1, T + 1)]
+    TOCEAN.setRecords(tocean_records)
+
+
+def _propagate_climate_fair(m, v, data, cfg):
+    """Forward-propagate FAIR climate model from solved W_EMI levels.
+
+    Mirrors the GAMS 'solve fair using cns' after_solve pattern by
+    forward-evaluating the FAIR 4-box CO2 cycle, non-CO2 decay, forcing,
+    and two-box temperature from current emission levels.
+    """
+    from pydice32.modules.mod_climate_fair import (
+        BOX_NAMES, TAUBOX, EMSHARE, TAUGHG,
+        CONC_PREINDUSTRIAL, CO2toC, DELTA, FORC2X,
+        IRF_PREINDUSTRIAL, IRC, IRT,
+        _DERIVED,
+    )
+
+    T = cfg.T
+    TSTEP = cfg.TSTEP
+
+    emitoconc = _DERIVED["emitoconc"]
+    catm_pre = _DERIVED["catm_preindustrial"]
+    scaling_forc2x = _DERIVED["scaling_forc2x"]
+    QSLOW = _DERIVED["QSLOW"]
+    QFAST = _DERIVED["QFAST"]
+    dt0 = _DERIVED["dt0"]
+
+    slow_decay = math.exp(-TSTEP / 236.0)
+    fast_decay = math.exp(-TSTEP / 4.07)
+
+    # Read W_EMI levels: (ghg, t_str) -> float
+    W_EMI_var = v.get("W_EMI")
+    if W_EMI_var is None or W_EMI_var.records is None:
+        return
+    w_emi = {}
+    for _, row in W_EMI_var.records.iterrows():
+        w_emi[(str(row.iloc[0]), str(row.iloc[1]))] = row["level"]
+
+    # Read initial state from variable records
+    def _read_var_1d(varname):
+        var = v.get(varname)
+        if var is None or var.records is None:
+            return {}
+        d = {}
+        for _, row in var.records.iterrows():
+            d[str(row.iloc[0])] = row["level"]
+        return d
+
+    def _read_var_2d(varname):
+        var = v.get(varname)
+        if var is None or var.records is None:
+            return {}
+        d = {}
+        for _, row in var.records.iterrows():
+            d[(str(row.iloc[0]), str(row.iloc[1]))] = row["level"]
+        return d
+
+    res_levels = _read_var_2d("RES")        # (box, t) -> level
+    conc_levels = _read_var_2d("CONC")       # (ghg, t) -> level
+    cumemi_levels = _read_var_1d("CUMEMI_FAIR")
+    cd_scale = _read_var_1d("CD_SCALE")
+    ff_ch4 = _read_var_1d("FF_CH4")
+    tslow_levels = _read_var_1d("TSLOW")
+    tfast_levels = _read_var_1d("TFAST")
+    tatm_levels = _read_var_1d("TATM")
+    forc_levels = _read_var_1d("FORC")
+
+    cp_co2 = CONC_PREINDUSTRIAL["co2"]
+    cp_ch4 = CONC_PREINDUSTRIAL["ch4"]
+    cp_n2o = CONC_PREINDUSTRIAL["n2o"]
+
+    ch4_decay = math.exp(-TSTEP / TAUGHG["ch4"])
+    n2o_decay = math.exp(-TSTEP / TAUGHG["n2o"])
+    co2_over_ch4 = 44.01 / 16.04
+
+    for t in range(1, T):
+        ts = str(t)
+        tp1 = str(t + 1)
+
+        # Current CD_SCALE
+        cds = cd_scale.get(ts, 1.0)
+
+        # 1. CO2 reservoirs: RES(box, t+1)
+        w_co2 = w_emi.get(("co2", tp1), w_emi.get(("co2", ts), 0.0))
+
+        # H2: Compute non-CO2 concentrations FIRST, then use CONC(ch4,tp1) for
+        # methane oxidation (matching GAMS: OXI_CH4(tp1) uses CONC('ch4',tp1)).
+        # 2. Non-CO2 concentrations (moved before CO2 reservoirs)
+        for ghg in ["ch4", "n2o"]:
+            conc_old = conc_levels.get((ghg, ts), CONC_PREINDUSTRIAL[ghg])
+            w1 = w_emi.get((ghg, tp1), w_emi.get((ghg, ts), 0.0))
+            w0 = w_emi.get((ghg, ts), 0.0)
+            tau_ghg = TAUGHG[ghg]
+            decay = math.exp(-TSTEP / tau_ghg)
+            nat_emi = (CONC_PREINDUSTRIAL[ghg] / emitoconc[ghg]) * (1 - decay) / TSTEP
+            conc_new = (conc_old * decay
+                        + ((w1 + w0) / 2 + nat_emi) * emitoconc[ghg] * TSTEP)
+            conc_levels[(ghg, tp1)] = max(conc_new, 1e-9)
+
+        # Methane oxidation using CONC(ch4, tp1) -- GAMS eq_methoxi(tp1)
+        conc_ch4_tp1 = conc_levels.get(("ch4", tp1), CONC_PREINDUSTRIAL["ch4"])
+        ff_ch4_t = ff_ch4.get(ts, 0.3)
+        ch4_oxi = (1e-3 * co2_over_ch4 * 0.61 * ff_ch4_t
+                    * (conc_ch4_tp1 - cp_ch4) * (1 - ch4_decay))
+
+        for box in BOX_NAMES:
+            tau = TAUBOX[box]
+            old = res_levels.get((box, ts), 0.0)
+            new_val = (old * math.exp(-TSTEP / (tau * cds))
+                       + EMSHARE[box] * (w_co2 + ch4_oxi) * emitoconc["co2"] * TSTEP)
+            res_levels[(box, tp1)] = new_val
+
+        # CO2 concentration
+        conc_co2_tp1 = cp_co2 + sum(res_levels.get((b, tp1), 0) for b in BOX_NAMES)
+        conc_levels[("co2", tp1)] = conc_co2_tp1
+
+        # 3. Forcing
+        c_co2 = conc_levels.get(("co2", tp1), cp_co2)
+        c_ch4 = conc_levels.get(("ch4", tp1), cp_ch4)
+        c_n2o = conc_levels.get(("n2o", tp1), cp_n2o)
+
+        dc_co2 = c_co2 - cp_co2
+        dc_ch4 = c_ch4 - cp_ch4
+        dc_n2o = c_n2o - cp_n2o
+
+        rf_co2 = ((-2.4e-7 * dc_co2**2
+                   + 7.2e-4 * (math.sqrt(dc_co2**2 + DELTA**2) - DELTA)
+                   - 1.05e-4 * (c_n2o + cp_n2o)
+                   + 5.36) * math.log(max(c_co2, 1e-6) / cp_co2) / scaling_forc2x)
+
+        rf_ch4 = ((-6.5e-7 * (c_ch4 + cp_ch4)
+                   - 4.1e-6 * (c_n2o + cp_n2o) + 0.043)
+                  * (math.sqrt(max(c_ch4, 0)) - math.sqrt(cp_ch4)))
+
+        rf_n2o = ((-4.0e-6 * (c_co2 + cp_co2)
+                   + 2.1e-6 * (c_n2o + cp_n2o)
+                   - 2.45e-6 * (c_ch4 + cp_ch4) + 0.117)
+                  * (math.sqrt(max(c_n2o, 0)) - math.sqrt(cp_n2o)))
+
+        rf_h2o = 0.12 * rf_ch4
+
+        # O3trop (simplified: no exogenous NOx/CO/NMVOC terms, same as Python module)
+        tatm_t = tatm_levels.get(ts, 1.1)
+        o3_temp_term = 0.032 * (math.exp(-1.35 * (tatm_t + dt0)) - 1)
+        rf_o3 = (1.74e-4 * dc_ch4
+                 + (o3_temp_term - math.sqrt(o3_temp_term**2 + 1e-16)) / 2)
+
+        # Exogenous forcing (read from parameter if available)
+        par_fex = data.get("_params", {}).get("par_forcing_exogenous")
+        fex = 0.0
+        if par_fex is not None and par_fex.records is not None:
+            fex_row = par_fex.records[par_fex.records.iloc[:, 0] == tp1]
+            if not fex_row.empty:
+                fex = float(fex_row["value"].iloc[0])
+
+        forc_tp1 = rf_co2 + rf_ch4 + rf_n2o + rf_h2o + rf_o3 + fex
+        forc_levels[tp1] = forc_tp1
+
+        # 4. Temperature
+        tslow_t = tslow_levels.get(ts, _DERIVED["tslow0"])
+        tfast_t = tfast_levels.get(ts, _DERIVED["tfast0"])
+        forc_t = forc_levels.get(ts, forc_tp1)
+
+        tslow_tp1 = tslow_t * slow_decay + QSLOW * forc_t * (1 - slow_decay)
+        tfast_tp1 = tfast_t * fast_decay + QFAST * forc_t * (1 - fast_decay)
+        tatm_tp1 = tslow_tp1 + tfast_tp1 - dt0
+
+        tslow_levels[tp1] = tslow_tp1
+        tfast_levels[tp1] = tfast_tp1
+        tatm_levels[tp1] = tatm_tp1
+
+        # 5. Update cumulative emissions and CD_SCALE for next step
+        cum_old = cumemi_levels.get(ts, CONC_PREINDUSTRIAL["co2"] / emitoconc["co2"])
+        cumemi_levels[tp1] = cum_old + (w_co2 + ch4_oxi) * TSTEP
+
+        c_atm_tp1 = conc_co2_tp1 / emitoconc["co2"]
+        c_sinks_tp1 = cumemi_levels[tp1] - (c_atm_tp1 - catm_pre)
+        irf_rhs = min(IRF_PREINDUSTRIAL + IRC * c_sinks_tp1 * CO2toC
+                      + IRT * (tatm_tp1 + dt0), 97.0)
+        # Solve CD_SCALE from IRF (approximate: use Newton-style iteration)
+        cds_new = cds  # start from current
+        for _ in range(5):  # few Newton iterations
+            irf_val = cds_new * sum(
+                EMSHARE[b] * TAUBOX[b] * (1 - math.exp(-100 / (cds_new * TAUBOX[b])))
+                for b in BOX_NAMES)
+            irf_deriv = sum(
+                EMSHARE[b] * TAUBOX[b] * (1 - math.exp(-100 / (cds_new * TAUBOX[b]))
+                                           - 100 / (cds_new * TAUBOX[b])
+                                           * math.exp(-100 / (cds_new * TAUBOX[b])))
+                for b in BOX_NAMES)
+            if abs(irf_deriv) < 1e-15:
+                break
+            cds_new = max(0.01, cds_new - (irf_val - irf_rhs) / irf_deriv)
+        cd_scale[tp1] = min(max(cds_new, 0.01), 1000.0)
+
+    # Write back all updated levels
+    def _write_1d(varname, levels_dict):
+        var = v.get(varname)
+        if var is not None:
+            recs = [(str(t), levels_dict.get(str(t), 0.0))
+                    for t in range(1, T + 1)]
+            var.setRecords(recs)
+
+    def _write_2d(varname, levels_dict, dim1_keys):
+        var = v.get(varname)
+        if var is not None:
+            recs = [(k1, str(t), levels_dict.get((k1, str(t)), 0.0))
+                    for k1 in dim1_keys for t in range(1, T + 1)]
+            var.setRecords(recs)
+
+    _write_2d("RES", res_levels, BOX_NAMES)
+    _write_2d("CONC", conc_levels, ["co2", "ch4", "n2o"])
+    _write_1d("CUMEMI_FAIR", cumemi_levels)
+    _write_1d("CD_SCALE", cd_scale)
+    _write_1d("TSLOW", tslow_levels)
+    _write_1d("TFAST", tfast_levels)
+    _write_1d("TATM", tatm_levels)
+    _write_1d("FORC", forc_levels)
+
+    # Also update TOCEAN-equivalent (FAIR uses TSLOW+TFAST, no TOCEAN)
+    # but TATM is the key variable for convergence checking.
 
 
 # ---------------------------------------------------------------------------
@@ -825,10 +1094,10 @@ def _print_errors(allerr, iteration):
 def _update_negishi_weights(v, data, cfg):
     """Update Negishi weights from solved CPC levels.
 
-    Standard Negishi weights use the NEGATIVE exponent so that poorer
-    regions (lower CPC) receive higher weight, reflecting higher
-    marginal utility of consumption:
-      nweights(t,n) = CPC.l(t,n)^(-elasmu) / sum(nn, CPC.l(t,nn)^(-elasmu))
+    GAMS core_cooperation.gms line 18: Negishi weights use the POSITIVE
+    exponent so that richer regions (higher CPC) receive higher weight,
+    equalizing weighted marginal utilities at the solution:
+      nweights(t,n) = CPC.l(t,n)^(elasmu) / sum(nn, CPC.l(t,nn)^(elasmu))
     """
     CPC = v.get("CPC")
     if CPC is None or CPC.records is None or len(CPC.records) == 0:
@@ -855,7 +1124,7 @@ def _update_negishi_weights(v, data, cfg):
         denom = 0.0
         for r in region_names:
             cpc_val = cpc_levels.get((t_str, r), 1e-8)
-            num = cpc_val ** (-elasmu)
+            num = cpc_val ** elasmu
             numerators[r] = num
             denom += num
 
@@ -871,7 +1140,14 @@ def _update_negishi_weights(v, data, cfg):
 # ---------------------------------------------------------------------------
 
 _NASH_FIX_VARS_3D = ["MIU"]           # domain (t, n, ghg)
-_NASH_FIX_VARS_2D = ["S", "MIULAND"]  # domain (t, n)
+# All decision variables that need fixing in Nash mode.
+# GAMS implicitly excludes other regions' equations via reg(n);
+# Python must explicitly fix their decision variables.
+_NASH_FIX_VARS_2D = [
+    "S", "MIULAND",
+    "E_NEG", "I_CDR",        # DAC (mod_dac)
+    "N_SAI",                  # SAI (mod_sai)
+]
 
 
 def _safe_bound(val, default):
@@ -1232,6 +1508,22 @@ def _create_parameters(m, sets, data, cfg):
     p["par_s0"] = Parameter(m, name="s0", domain=[n_set],
                              records=[(r, data["s0_agg"].get(r, 0.2)) for r in rn])
 
+    # Ocean VSL: US GDP per capita at t=1 for VSL normalization
+    # GAMS: VSL = vsl_start * global_gdppc(t) / US_gdppc(1)
+    # Find the US region in GCAM-32 and compute its GDP per capita
+    us_region_name = None
+    for r in rn:
+        if r.lower() in ("usa", "united states"):
+            us_region_name = r
+            break
+    if us_region_name is not None:
+        us_yk = data["ykali_dict"].get((1, us_region_name), 0)
+        us_pop = data["pop_dict"].get((1, us_region_name), 1)
+        if us_pop > 0 and us_yk > 0:
+            us_gdppc_1 = us_yk / us_pop * 1e6  # T$/million -> $/person
+            p["par_us_gdppc_1"] = Parameter(
+                m, name="us_gdppc_1", records=us_gdppc_1)
+
     # D7: DAC total cost parameter (for iterative learning-curve updates)
     # Created unconditionally so _update_dac_learning can write back to it.
     if getattr(cfg, "dac", False):
@@ -1285,10 +1577,9 @@ def _create_parameters(m, sets, data, cfg):
             p["ada_exp_scalar"] = sum(exp_vals) / len(exp_vals)
 
     # Region weights for welfare function (Negishi or population-based)
-    # Standard Negishi weights use the NEGATIVE exponent so that poorer
-    # regions (lower CPC) receive higher weight, reflecting higher
-    # marginal utility of consumption:
-    #   nweights(t,n) = CPC(t,n)^(-elasmu) / sum(nn, CPC(t,nn)^(-elasmu))
+    # GAMS core_cooperation.gms line 18: Negishi weights use the POSITIVE
+    # exponent, equalizing weighted marginal utilities at the solution:
+    #   nweights(t,n) = CPC(t,n)^(elasmu) / sum(nn, CPC(t,nn)^(elasmu))
     # Updated iteratively in solve_model_iterative/_update_negishi_weights.
     # For single-pass optimization: compute initial weights from starting CPC.
     if cfg.region_weights == "negishi":
@@ -1301,7 +1592,7 @@ def _create_parameters(m, sets, data, cfg):
                 s = data["fixed_savings"].get((t, r), 0.2)
                 pop_val = max(data["pop_dict"].get((t, r), 1.0), 1e-6)
                 cpc_vals[r] = max(yk * (1 - s) / pop_val * 1e6, 1e-8)
-            numerators = {r: cpc_vals[r] ** (-elasmu) for r in rn}
+            numerators = {r: cpc_vals[r] ** elasmu for r in rn}
             denom = sum(numerators.values())
             for r in rn:
                 nw = numerators[r] / denom if denom > 0 else 1.0

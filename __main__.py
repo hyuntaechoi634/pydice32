@@ -51,6 +51,14 @@ def main():
             cfg.impact = "dice"
         elif arg == "--kalkuhl":
             cfg.impact = "kalkuhl"
+        elif arg == "--burke":
+            cfg.impact = "burke"
+        elif arg.startswith("--bhm-spec="):
+            cfg.bhm_spec = arg.split("=")[1]
+        elif arg == "--fair":
+            cfg.climate = "fair"
+        elif arg == "--witchco2":
+            cfg.climate = "witchco2"
         elif arg == "--damage-cap":
             cfg.damage_cap = True
         elif arg == "--flexible":
@@ -89,6 +97,11 @@ def main():
             cfg.convergence_tol = float(arg.split("=")[1])
         else:
             print(f"Warning: unknown argument '{arg}'")
+
+    # H6: Re-apply policy defaults and validation after CLI overrides.
+    # This ensures --burke sets damage_cap=True, etc.
+    cfg._apply_policy_defaults()
+    cfg._validate()
 
     m, rice, v, data = build_model(cfg)
 
