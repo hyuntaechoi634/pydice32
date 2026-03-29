@@ -10,7 +10,7 @@ PyDICE32 is a partial translation of the GAMS-based RICE50x model into Python us
 
 ![Global CO2 Emission Pathways](docs/spaghetti_emissions.png)
 
-*Global CO2 emission pathways across 30 scenarios (5 policies x 2 damage functions x 3 MACC cost assumptions). Solid lines show the median MACC (prob50); shaded bands span prob25-prob75 uncertainty.*
+*Global CO2 emissions under 4 policy scenarios (Kalkuhl damages, prob50 MACC). CTax30 uses ctax_marginal=True ($30/tCO2, 3%/yr growth). NZ2050 reaches net-zero at 2050; CBA finds the welfare-optimal path.*
 
 ## Features
 
