@@ -29,7 +29,7 @@ from pydice32.solver import build_model, solve_model
 POLICIES = [
     ("BAU",     dict(policy="bau_impact", impact="kalkuhl")),
     ("CBA",     dict(policy="cba", impact="kalkuhl")),
-    ("CTax50",  dict(policy="ctax", impact="kalkuhl", ctax_initial=50, ctax_slope=0.03)),
+    ("CTax30",  dict(policy="ctax", impact="kalkuhl", ctax_initial=30, ctax_slope=0.03)),
     ("NZ2050",  dict(policy="global_netzero", impact="kalkuhl", nz_year=2050)),
 ]
 
@@ -38,7 +38,7 @@ T_RANGE = list(range(2, 19))
 TSTEP = 5
 YEARS = [2015 + (t - 1) * TSTEP for t in T_RANGE]
 
-COLORS = {"BAU": "#888888", "CBA": "#2196F3", "CTax50": "#FF9800", "NZ2050": "#4CAF50"}
+COLORS = {"BAU": "#888888", "CBA": "#2196F3", "CTax30": "#FF9800", "NZ2050": "#4CAF50"}
 
 
 def _sum(var, t_range, ghg=None):
@@ -128,31 +128,51 @@ def _vals(results, name, var):
 def generate_charts(results):
     print("\nGenerating charts...")
 
-    def _plot(fname, ylabel, title, var, **kw):
+    def _plot(fname, ylabel, var, notes=None, **kw):
         fig, ax = plt.subplots(figsize=(8, 4))
         for pname, _ in POLICIES:
             ax.plot(YEARS, _vals(results, pname, var),
                     color=COLORS[pname], label=pname, linewidth=1.5)
         ax.set_xlabel("Year")
         ax.set_ylabel(ylabel)
-        ax.set_title(title)
         ax.legend()
         if kw.get("hline") is not None:
             ax.axhline(kw["hline"], color="gray", ls="--", lw=0.5)
+        if notes:
+            fig.text(0.02, -0.02, f"Notes: {notes}", fontsize=7,
+                     color="gray", va="top", ha="left", style="italic")
         fig.tight_layout()
+        fig.subplots_adjust(bottom=0.18 if notes else 0.12)
         fig.savefig(os.path.join(OUT_DIR, fname), dpi=150)
         plt.close(fig)
 
-    _plot("01_temperature.png", "deg C", "Global Mean Temperature", "TATM")
-    _plot("02_co2_emissions.png", "GtCO2/yr", "Global CO2 Emissions", "E_CO2", hline=0)
-    _plot("03_gdp.png", "T$", "Global GDP", "Y")
-    _plot("04_miu_co2.png", "MIU", "CO2 Abatement Rate (avg)", "MIU_avg")
-    _plot("05_abatecost.png", "T$", "Abatement Cost", "ABATECOST")
-    _plot("06_carbon_price.png", "$/tCO2", "Carbon Price (MAC avg)", "MAC_co2_avg")
-    _plot("07_consumption.png", "$/person", "Consumption per Capita (avg)", "CPC_mean")
-    _plot("08_damages.png", "T$", "Climate Damages", "DAMAGES")
-    _plot("09_damfrac.png", "fraction", "Damage Fraction (avg)", "DAMFRAC_avg")
-    _plot("10_savings.png", "rate", "Savings Rate (avg)", "S_avg")
+    # Extract key numbers for notes
+    bau_t2100 = results["BAU"]["TATM"].get(18, 0)
+    cba_t2100 = results["CBA"]["TATM"].get(18, 0)
+    nz_t2100 = results["NZ2050"]["TATM"].get(18, 0)
+    bau_dmg = results["BAU"]["DAMAGES"].get(18, 0)
+    cba_gdp = results["CBA"]["Y"].get(18, 0)
+    bau_gdp = results["BAU"]["Y"].get(18, 0)
+
+    _plot("01_temperature.png", "deg C", "TATM",
+          notes=f"BAU reaches {bau_t2100:.1f}C by 2100. CBA optimal: {cba_t2100:.1f}C. NZ2050: {nz_t2100:.1f}C.")
+    _plot("02_co2_emissions.png", "GtCO2/yr", "E_CO2", hline=0,
+          notes="NZ2050 reaches net-zero at 2050. CBA converges to near-zero by 2100.")
+    _plot("03_gdp.png", "T$", "Y",
+          notes=f"BAU GDP ({bau_gdp:.0f}T$) falls below CBA ({cba_gdp:.0f}T$) after ~2060 due to climate damages.")
+    _plot("04_miu_co2.png", "MIU", "MIU_avg",
+          notes="MIU = fraction of CO2 abated. BAU = 0 (no policy). NZ2050 ramps fastest.")
+    _plot("05_abatecost.png", "T$", "ABATECOST",
+          notes="Higher abatement cost reflects stronger mitigation effort.")
+    _plot("06_carbon_price.png", "$/tCO2", "MAC_co2_avg",
+          notes="MAC = marginal abatement cost = implicit carbon price.")
+    _plot("07_consumption.png", "$/person", "CPC_mean",
+          notes="Per-capita consumption. Policy scenarios overtake BAU as damages grow.")
+    _plot("08_damages.png", "T$", "DAMAGES",
+          notes=f"BAU damages reach {bau_dmg:.0f}T$ by 2100. Mitigation sharply reduces damages.")
+    _plot("09_damfrac.png", "fraction", "DAMFRAC_avg",
+          notes="Fraction of GDP lost to climate damages. Kalkuhl growth-rate specification.")
+    _plot("10_savings.png", "rate", "S_avg")
 
     # GDP loss vs BAU
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -166,9 +186,12 @@ def generate_charts(results):
     ax.axhline(0, color="gray", ls="--", lw=0.5)
     ax.set_xlabel("Year")
     ax.set_ylabel("GDP change vs BAU (%)")
-    ax.set_title("GDP Change Relative to BAU (positive = net gain from policy)")
     ax.legend()
+    fig.text(0.02, -0.02,
+             "Notes: Positive = net GDP gain from policy (damage reduction > abatement cost).",
+             fontsize=7, color="gray", va="top", ha="left", style="italic")
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.18)
     fig.savefig(os.path.join(OUT_DIR, "11_gdp_loss_vs_bau.png"), dpi=150)
     plt.close(fig)
 
@@ -192,7 +215,7 @@ def sanity_checks(results):
 
     bau = results["BAU"]
     cba = results["CBA"]
-    ctax = results["CTax50"]
+    ctax = results["CTax30"]
     nz = results["NZ2050"]
 
     # BAU damages must be > 0
@@ -226,7 +249,7 @@ def sanity_checks(results):
 
     # Print key numbers
     print(f"\n  Key values at 2100:")
-    for p in ["BAU", "CBA", "CTax50", "NZ2050"]:
+    for p in ["BAU", "CBA", "CTax30", "NZ2050"]:
         r = results[p]
         print(f"    {p:8s}: TATM={r['TATM'][18]:.2f}C  "
               f"GDP={r['Y'][18]:.0f}T$  "
