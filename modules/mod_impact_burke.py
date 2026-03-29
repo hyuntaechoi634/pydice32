@@ -130,7 +130,17 @@ def define_eqs(m, sets, params, cfg, v):
             rich_T, rich_T2 = BHM_LRDIFF_RICH_T, BHM_LRDIFF_RICH_T2
             poor_T, poor_T2 = BHM_LRDIFF_POOR_T, BHM_LRDIFF_POOR_T2
 
-        # Compute per-region, per-period GDP per capita
+        # GAMS mod_impact_burke.gms lines 88-104: rich/poor classification
+        # uses country-level GDPpc with median cutoff across all countries.
+        # Use country-level ykali/pop from calibration data for the cutoff,
+        # then compute population-weighted average coefficients per region.
+        from pydice32.data.gcam_mapping import load_rice_regions, load_gcam_mapping, load_gcam_region_names
+        ykali_country = params.get("_emi_bau_country", {})  # reuse for existence check
+        # Get country-level data from calibration (stored in data via params)
+        cal_ykali_country = params.get("_ykali_country", {})
+        cal_pop_country = params.get("_pop_country", {})
+
+        # Region-level data (fallback if country data unavailable)
         ykali_recs = {}
         pop_recs = {}
         if hasattr(par_ykali, 'records') and par_ykali.records is not None:
@@ -140,31 +150,76 @@ def define_eqs(m, sets, params, cfg, v):
             for _, row in par_pop.records.iterrows():
                 pop_recs[(str(row.iloc[0]), str(row.iloc[1]))] = float(row.iloc[2])
 
-        # Compute median GDP per capita per period
         beta_T_recs = []
         beta_T2_recs = []
-        for t in range(1, T + 1):
-            # Compute GDP per capita for all regions
-            gdppc = {}
-            for r in region_names:
-                yk = ykali_recs.get((str(t), r), 0)
-                pp = pop_recs.get((str(t), r), 1)
-                gdppc[r] = yk * 1e6 / max(pp, 1e-6)
 
-            # Median cutoff
-            vals = sorted(gdppc.values())
-            if len(vals) > 0:
-                cutoff = vals[len(vals) // 2]
-            else:
-                cutoff = 13205.0
+        if cal_ykali_country and cal_pop_country:
+            # Country-level classification (faithful to GAMS)
+            # Get GCAM mapping
+            try:
+                rice_regions = load_rice_regions(cfg.project_root)
+                gcam_map = load_gcam_mapping(cfg.gcam_csv, set(rice_regions))
+                gcam_nm = load_gcam_region_names(cfg.gcam_names_csv)
+            except Exception:
+                gcam_map, gcam_nm = {}, {}
 
-            for r in region_names:
-                if gdppc.get(r, 0) > cutoff:
-                    beta_T_recs.append((str(t), r, rich_T))
-                    beta_T2_recs.append((str(t), r, rich_T2))
-                else:
-                    beta_T_recs.append((str(t), r, poor_T))
-                    beta_T2_recs.append((str(t), r, poor_T2))
+            for t in range(1, T + 1):
+                # Compute country-level GDPpc and find median
+                country_gdppc = {}
+                for iso in cal_ykali_country:
+                    if isinstance(iso, tuple):
+                        continue
+                    yk = cal_ykali_country.get((t, iso), 0)
+                    pp = cal_pop_country.get((t, iso), 0)
+                    if pp > 0:
+                        country_gdppc[iso] = yk * 1e6 / pp
+
+                vals = sorted(country_gdppc.values())
+                cutoff = vals[len(vals) // 2] if vals else 13205.0
+
+                # For each region, population-weighted average of rich/poor coefficients
+                for r in region_names:
+                    rich_pop = 0.0
+                    poor_pop = 0.0
+                    for iso, gdppc_val in country_gdppc.items():
+                        if iso not in gcam_map:
+                            continue
+                        if gcam_nm.get(gcam_map[iso]) != r:
+                            continue
+                        pp = cal_pop_country.get((t, iso), 0)
+                        if gdppc_val > cutoff:
+                            rich_pop += pp
+                        else:
+                            poor_pop += pp
+                    total = rich_pop + poor_pop
+                    if total > 0:
+                        w_rich = rich_pop / total
+                    else:
+                        # Fallback: use region-level classification
+                        yk = ykali_recs.get((str(t), r), 0)
+                        pp = pop_recs.get((str(t), r), 1)
+                        w_rich = 1.0 if yk * 1e6 / max(pp, 1e-6) > cutoff else 0.0
+                    coef_T = w_rich * rich_T + (1 - w_rich) * poor_T
+                    coef_T2 = w_rich * rich_T2 + (1 - w_rich) * poor_T2
+                    beta_T_recs.append((str(t), r, coef_T))
+                    beta_T2_recs.append((str(t), r, coef_T2))
+        else:
+            # Fallback: region-level classification (original behavior)
+            for t in range(1, T + 1):
+                gdppc = {}
+                for r in region_names:
+                    yk = ykali_recs.get((str(t), r), 0)
+                    pp = pop_recs.get((str(t), r), 1)
+                    gdppc[r] = yk * 1e6 / max(pp, 1e-6)
+                vals = sorted(gdppc.values())
+                cutoff = vals[len(vals) // 2] if vals else 13205.0
+                for r in region_names:
+                    if gdppc.get(r, 0) > cutoff:
+                        beta_T_recs.append((str(t), r, rich_T))
+                        beta_T2_recs.append((str(t), r, rich_T2))
+                    else:
+                        beta_T_recs.append((str(t), r, poor_T))
+                        beta_T2_recs.append((str(t), r, poor_T2))
 
         par_beta_T = GParam(m, name="beta_bhm_T",
                             domain=[t_set, n_set], records=beta_T_recs)

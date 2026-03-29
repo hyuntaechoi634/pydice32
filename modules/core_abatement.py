@@ -78,17 +78,15 @@ def define_eqs(m, sets, params, cfg, v):
     # ------------------------------------------------------------------
     # MIU upper bounds (GAMS core_abatement.gms compute_vars)
     # GAMS: MIU.up(t,n,ghg)$(not tmiufix(t)) = maxmiu_pbl(t,n,ghg)
-    # Must skip tmiufix periods AND bau/bau_impact/simulation (MIU.fx=0
-    # for all t), because setting .up in define_eqs (Pass 2) overrides
-    # the .fx set in core_policy declare_vars (Pass 1).
+    # Set MIU.up for all periods first, then re-fix tmiufix periods to 0.
+    # For bau/bau_impact/simulation, skip entirely (MIU.fx=0 for all t).
     # ------------------------------------------------------------------
-    if cfg.policy in ("bau", "bau_impact", "simulation"):
-        pass  # MIU.fx=0 for all periods, don't override
-    else:
-        tmiufix_set = set(cfg.tmiufix)
-        for t_idx in range(1, cfg.T + 1):
-            if t_idx not in tmiufix_set:
-                MIU.up[str(t_idx), n_set, ghg_set] = par_maxmiu_pbl[str(t_idx), n_set, ghg_set]
+    if cfg.policy not in ("bau", "bau_impact", "simulation"):
+        MIU.up[t_set, n_set, ghg_set] = par_maxmiu_pbl[t_set, n_set, ghg_set]
+        # Re-apply tmiufix: restore MIU.fx=0 for fixed periods
+        # (the .up assignment above overrides the .fx set in core_policy)
+        for t_idx in cfg.tmiufix:
+            MIU.fx[str(t_idx), n_set, ghg_set] = 0
 
     # ------------------------------------------------------------------
     # Equations

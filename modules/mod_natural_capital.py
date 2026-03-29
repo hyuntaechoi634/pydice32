@@ -75,6 +75,17 @@ def _load_natcap_data(data_dir, region_names):
                 elasticity[(rn_lower[n], factor)] = float(row["Val"])
     result["elasticity"] = elasticity
 
+    # natural_capital_global_elasticity: n -> value
+    gelast_file = os.path.join(nc_dir, "natural_capital_global_elasticity.csv")
+    global_elasticity = {}
+    if os.path.exists(gelast_file):
+        df = pd.read_csv(gelast_file)
+        for _, row in df.iterrows():
+            n = str(row.iloc[0]).lower()
+            if n in rn_lower:
+                global_elasticity[rn_lower[n]] = float(row["Val"])
+    result["global_elasticity"] = global_elasticity
+
     return result
 
 
@@ -193,6 +204,18 @@ def define_eqs(m, sets, params, cfg, v):
     par_damcoef = Parameter(m, name="natcap_damcoef",
                             domain=[nc_type, n_set], records=dam_recs)
 
+    # Production function parameters for eq_ygross
+    # GAMS: prodshare('nature',n) = natural_capital_elasticity(n,'mN')
+    # GAMS: natural_capital_global_elasticity(n) loaded from GDX
+    elasticity = nc_data.get("elasticity", {})
+    global_elasticity = nc_data.get("global_elasticity", {})
+    nature_share_recs = [(r, elasticity.get((r, "mn"), 0.0)) for r in region_names]
+    gelast_recs = [(r, global_elasticity.get(r, 0.0)) for r in region_names]
+    params["par_prodshare_nature"] = Parameter(
+        m, name="prodshare_nature", domain=[n_set], records=nature_share_recs)
+    params["par_natcap_global_elasticity"] = Parameter(
+        m, name="natcap_global_elasticity", domain=[n_set], records=gelast_recs)
+
     equations = []
 
     # ------------------------------------------------------------------
@@ -247,11 +270,20 @@ def define_eqs(m, sets, params, cfg, v):
     # GAMS: damage applied only when $setglobal nat_cap_damages is set.
     # When not set, NAT_CAP_DAM = NAT_CAP_BASE (no climate damage).
     nat_cap_damages = getattr(cfg, "nat_cap_damages", False)
+    nat_cap_damfun = getattr(cfg, "nat_cap_damfun", "lin")
     if nat_cap_damages:
+        # GAMS mod_natural_capital.gms lines 205-211: damfun branching
+        from gamspy.math import log as glog
+        if nat_cap_damfun == "sq":
+            dam_term = (TATM[t_set] - TATM0) ** 2
+        elif nat_cap_damfun == "log":
+            dam_term = glog(1 + TATM[t_set] - TATM0)
+        else:  # "lin" default
+            dam_term = TATM[t_set] - TATM0
         eq_nat_cap_dam[nc_type, t_set, n_set] = (
             NAT_CAP_DAM[nc_type, t_set, n_set] ==
             NAT_CAP_BASE[nc_type, t_set, n_set]
-            * (1 + par_damcoef[nc_type, n_set] * (TATM[t_set] - TATM0))
+            * (1 + par_damcoef[nc_type, n_set] * dam_term)
         )
     else:
         eq_nat_cap_dam[nc_type, t_set, n_set] = (
@@ -285,7 +317,9 @@ def define_eqs(m, sets, params, cfg, v):
     # UTARG(t,n) = [(1-share)*CPC^theta + share*(NAT_CAP_DAM('nonmarket')/pop*1e6)^theta]^(1/theta)
     # Only when natural capital utility integration is active.
     # ------------------------------------------------------------------
-    nat_cap_utility = getattr(cfg, "nat_cap_utility", True)
+    # GAMS mod_natural_capital.gms line 19-20: nat_cap_utility and
+    # nat_cap_prodfun are COMMENTED OUT by default (require explicit $setglobal).
+    nat_cap_utility = getattr(cfg, "nat_cap_utility", False)
     if nat_cap_utility and "UTARG" in v and "CPC" in v:
         from gamspy.math import log as glog  # noqa: avoid unused import if not needed
         CPC = v["CPC"]

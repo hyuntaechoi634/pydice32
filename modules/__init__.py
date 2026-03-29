@@ -1,5 +1,9 @@
 """
-PyDICE32 modules -- each corresponds to a GAMS .gms module file.
+PyDICE32 modules -- translated from GAMS .gms module files.
+
+NOTE: This is not a 1:1 file-for-file port. Some GAMS modules are merged
+(core_time, core_regions, pol_ndc), some are partial translations, and
+several source modules are not yet implemented (see README.md Coverage).
 
 Each module exposes a ``define(m, sets, params, cfg, v)`` function:
   m      : GAMSPy Container
@@ -24,6 +28,7 @@ Loading order (respects cross-module variable dependencies):
 
 Optional extension modules (enabled via config flags):
   mod_dac              -- Direct Air Capture (cfg.dac=True)
+  mod_emi_stor         -- CCS Storage per-type (loaded with mod_dac)
   mod_sai              -- Stratospheric Aerosol Injection (cfg.sai=True)
   mod_adaptation       -- Adaptation investment (cfg.adaptation=True)
   mod_ocean            -- Ocean capital & ecosystem services (cfg.ocean=True)
@@ -43,11 +48,17 @@ from pydice32.modules import (
     mod_impact_dice,
     mod_impact_kalkuhl,
     mod_impact_burke,
+    mod_impact_howard,
+    mod_impact_dell,
+    mod_impact_coacch,
+    mod_impact_deciles,
     mod_climate_regional,
     mod_climate_fair,
+    mod_climate_tatm_exogen,
     mod_landuse,
     core_policy,
     mod_dac,
+    mod_emi_stor,
     mod_sai,
     mod_adaptation,
     mod_ocean,
@@ -67,11 +78,16 @@ __all__ = [
     "mod_impact_dice",
     "mod_impact_kalkuhl",
     "mod_impact_burke",
+    "mod_impact_howard",
+    "mod_impact_dell",
+    "mod_impact_coacch",
+    "mod_impact_deciles",
     "mod_climate_regional",
     "mod_climate_fair",
     "mod_landuse",
     "core_policy",
     "mod_dac",
+    "mod_emi_stor",
     "mod_sai",
     "mod_adaptation",
     "mod_ocean",

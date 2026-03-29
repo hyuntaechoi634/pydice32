@@ -43,11 +43,12 @@ def load_gcam_mapping(gcam_csv, rice_regions):
             continue
         if iso in rice_regions and 1 <= gid <= 32:
             mapping[iso] = gid
-    # C2: RICE50x 'row' (Rest of World) has no GCAM mapping.
-    # Assign to Southeast Asia (region 29) -- covers Pacific islands and
-    # miscellaneous territories that compose the RICE50x 'row' aggregate.
-    if "row" in rice_regions and "row" not in mapping:
-        mapping["row"] = 29
+    # RICE50x 'row' (Rest of World) has no GCAM mapping.
+    # Previously forced into Southeast Asia (region 29), but this inflates
+    # that region's GDP/population/emissions by ~44%/74%.
+    # Now excluded: 'row' countries are dropped from aggregation.
+    # Their contribution is small (<1% global GDP) and distributing them
+    # would require per-country breakdown unavailable in RICE50x.
     return mapping
 
 

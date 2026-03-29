@@ -140,13 +140,30 @@ def declare_vars(m, sets, params, cfg, v):
             gcam_map = load_gcam_mapping(cfg.gcam_csv, rice_set)
             gcam_nm = load_gcam_region_names(cfg.gcam_names_csv)
 
-            ndc_by_region = {}
+            # Emissions-weighted average for NDC aggregation to GCAM regions.
+            # GAMS uses pre-aggregated regional NDC data; when aggregating
+            # from ISO3, weighted average is more faithful than max.
+            # Weight: country BAU CO2 emissions at t=4 (year 2030).
+            emi_bau_country = params.get("_emi_bau_country", {})
+
+            ndc_numerator = {}   # region -> sum(country_ndc * country_emi)
+            ndc_denominator = {} # region -> sum(country_emi)
             for _, row in ndc_df.iterrows():
                 n_val = str(row.iloc[0]).lower()
                 val = float(row["Val"])
                 if n_val in gcam_map:
                     rname = gcam_nm[gcam_map[n_val]]
-                    ndc_by_region[rname] = max(ndc_by_region.get(rname, 0), val)
+                    # Country BAU CO2 at t=4 as weight
+                    w = emi_bau_country.get((4, n_val, "co2"), 0.0)
+                    if w <= 0:
+                        w = 1e-6  # fallback: tiny weight to avoid division by zero
+                    ndc_numerator[rname] = ndc_numerator.get(rname, 0.0) + val * w
+                    ndc_denominator[rname] = ndc_denominator.get(rname, 0.0) + w
+
+            ndc_by_region = {}
+            for rname in ndc_numerator:
+                denom = ndc_denominator.get(rname, 1e-6)
+                ndc_by_region[rname] = ndc_numerator[rname] / denom if denom > 0 else 0.0
 
             for rname, ndc_val in ndc_by_region.items():
                 if ndc_val > 0:
@@ -154,6 +171,89 @@ def declare_vars(m, sets, params, cfg, v):
                     # the optimizer to exceed NDC targets if beneficial.
                     MIU.lo["3", rname, "co2"] = 0.5 * ndc_val
                     MIU.lo["4", rname, "co2"] = ndc_val
+
+            # ---------------------------------------------------------------
+            # MAC.lo for tmiufix periods + linear extrapolation post-2030
+            # GAMS pol_ndc.gms line 53 (compute_vars):
+            #   MAC.lo(t,n,ghg)$tmiufix(t) = c1*MIU.lo^1 + c4*MIU.lo^4
+            # GAMS pol_ndc.gms lines 66-68 (before_solve, ndcs_extr="linear"):
+            #   MAC.lo(t,n,ghg)$(year(t) gt 2030) = min(
+            #     MAC.lo('4') * (1 + slope * (year(t)-2030)),
+            #     cprice_max(t,n,ghg))
+            # GAMS pol_ndc.gms line 80:
+            #   ctax_corrected(t,n,ghg) = min(MAC.lo(t,n,ghg), cprice_max)
+            # ---------------------------------------------------------------
+            MAC = v.get("MAC")
+            if MAC is not None:
+                # Read MACC coefficients from params
+                macc_c1_recs = params.get("par_macc_c1")
+                macc_c4_recs = params.get("par_macc_c4")
+                maxmiu_recs = params.get("par_maxmiu_pbl")
+                if macc_c1_recs is not None and macc_c4_recs is not None:
+                    # Build lookup dicts for MACC coefficients
+                    c1_dict = {}
+                    if hasattr(macc_c1_recs, 'records') and macc_c1_recs.records is not None:
+                        for _, row in macc_c1_recs.records.iterrows():
+                            c1_dict[(str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))] = float(row.iloc[3])
+                    c4_dict = {}
+                    if hasattr(macc_c4_recs, 'records') and macc_c4_recs.records is not None:
+                        for _, row in macc_c4_recs.records.iterrows():
+                            c4_dict[(str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))] = float(row.iloc[3])
+                    miu_up_dict = {}
+                    if maxmiu_recs is not None and hasattr(maxmiu_recs, 'records') and maxmiu_recs.records is not None:
+                        for _, row in maxmiu_recs.records.iterrows():
+                            miu_up_dict[(str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))] = float(row.iloc[3])
+
+                    # Step 1: MAC.lo for tmiufix periods (from NDC MIU floors)
+                    mac_lo_at_4 = {}  # (region, ghg) -> MAC.lo at t=4
+                    mac_lo_at_2 = {}  # (region, ghg) -> MAC.lo at t=2
+                    for rname, ndc_val_r in ndc_by_region.items():
+                        if ndc_val_r <= 0:
+                            continue
+                        for ghg in cfg.ghg_list:
+                            for t_idx in cfg.tmiufix:
+                                if t_idx == 3:
+                                    miu_lo = 0.5 * ndc_val_r if ghg == "co2" else 0.0
+                                elif t_idx == 4:
+                                    miu_lo = ndc_val_r if ghg == "co2" else 0.0
+                                else:
+                                    miu_lo = 0.0
+                                c1 = c1_dict.get((str(t_idx), rname, ghg), 0.0)
+                                c4 = c4_dict.get((str(t_idx), rname, ghg), 0.0)
+                                mac_val = c1 * miu_lo + c4 * miu_lo ** 4
+                                if mac_val > 0:
+                                    MAC.lo[str(t_idx), rname, ghg] = mac_val
+                                if t_idx == 4:
+                                    mac_lo_at_4[(rname, ghg)] = mac_val
+                                if t_idx == 2:
+                                    mac_lo_at_2[(rname, ghg)] = mac_val
+
+                    # Step 2: Linear extrapolation post-2030
+                    # GAMS ndcs_extr="linear":
+                    #   MAC.lo(t,n,ghg)$(year(t) gt 2030 and MAC.l('4') ne 0)
+                    #     = min(MAC.lo('4') * (1 + slope*(year(t)-2030)),
+                    #           cprice_max(t,n,ghg))
+                    # where slope = (MAC.lo('4') - MAC.lo('2')) / (MAC.lo('4') * tstep * 2)
+                    for rname in ndc_by_region:
+                        for ghg in cfg.ghg_list:
+                            m4 = mac_lo_at_4.get((rname, ghg), 0.0)
+                            m2 = mac_lo_at_2.get((rname, ghg), 0.0)
+                            if m4 == 0:
+                                continue
+                            slope = (m4 - m2) / (m4 * cfg.TSTEP * 2) if m4 != 0 else 0
+                            for t in range(5, cfg.T + 1):
+                                yr = cfg.year(t)
+                                if yr <= 2030:
+                                    continue
+                                mac_extrap = m4 * (1 + slope * (yr - 2030))
+                                # Cap at cprice_max = MAC(MIU.up)
+                                miu_up = miu_up_dict.get((str(t), rname, ghg), 1.0)
+                                c1 = c1_dict.get((str(t), rname, ghg), 0.0)
+                                c4 = c4_dict.get((str(t), rname, ghg), 0.0)
+                                cp_max = c1 * miu_up + c4 * miu_up ** 4
+                                mac_floor = min(mac_extrap, cp_max)
+                                if mac_floor > 0:
+                                    MAC.lo[str(t), rname, ghg] = mac_floor
 
 
 def define_eqs(m, sets, params, cfg, v):
@@ -311,34 +411,6 @@ def define_eqs(m, sets, params, cfg, v):
             # non-CO2 MACC infeasibility.  Non-CO2 abatement is implicit
             # via GWP-scaled carbon tax in the fiscal revenue term.
             tmiufix_set = set(cfg.tmiufix)
-            # Compute cprice_max per (t, region) = MAC at MIU=maxmiu (CO2)
-            # GAMS: cprice_max(t,n,ghg) = c1*maxmiu^1 + c4*maxmiu^4
-            cprice_max_min = {}  # t -> min across regions of cprice_max
-            par_macc_c1 = params.get("par_macc_c1")
-            par_macc_c4 = params.get("par_macc_c4")
-            par_maxmiu = params.get("par_maxmiu_pbl")
-            if par_macc_c1 is not None and par_macc_c1.records is not None:
-                c1_df = par_macc_c1.records
-                c4_df = par_macc_c4.records if par_macc_c4 is not None else None
-                mu_df = par_maxmiu.records if par_maxmiu is not None else None
-                for _, row in c1_df[c1_df.iloc[:, 2] == "co2"].iterrows():
-                    t_s = str(row.iloc[0])
-                    n_s = str(row.iloc[1])
-                    c1_v = float(row["value"])
-                    c4_v = 0.0
-                    if c4_df is not None:
-                        c4r = c4_df[(c4_df.iloc[:,0]==t_s) & (c4_df.iloc[:,1]==n_s) & (c4_df.iloc[:,2]=="co2")]
-                        if len(c4r) > 0:
-                            c4_v = float(c4r["value"].iloc[0])
-                    mu = 1.0
-                    if mu_df is not None:
-                        mur = mu_df[(mu_df.iloc[:,0]==t_s) & (mu_df.iloc[:,1]==n_s) & (mu_df.iloc[:,2]=="co2")]
-                        if len(mur) > 0:
-                            mu = float(mur["value"].iloc[0])
-                    cp = c1_v * mu + c4_v * mu**4
-                    if t_s not in cprice_max_min or cp < cprice_max_min[t_s]:
-                        cprice_max_min[t_s] = cp
-
             ctax_sched_records = []
             for t in range(1, cfg.T + 1):
                 for ghg in cfg.ghg_list:
@@ -346,19 +418,22 @@ def define_eqs(m, sets, params, cfg, v):
                     if ghg != "co2" or t in tmiufix_set:
                         ctax_sched_records.append((str(t), ghg, 0.0))
                     else:
-                        # base_tax is in T$/GtCO2; GAMS: ctax_corrected = min(ctax*1e3, cprice_max)
+                        # base_tax in T$/GtCO2; MAC units = ctax * 1e3
                         tax = base_tax_records[t] * 1e3
-                        cap = cprice_max_min.get(str(t), 1e6)
-                        tax = min(tax, cap * 0.95)  # 5% margin for solver
                         ctax_sched_records.append((str(t), ghg, tax))
             par_ctax = Parameter(m, name="ctax_sched",
                                  domain=[t_set, ghg_set],
                                  records=ctax_sched_records)
 
+            # Use inequality (MAC <= tax) instead of equality to avoid
+            # infeasibility when region-specific MACC curves can't reach
+            # the uniform tax level.  The optimizer will push MAC up to
+            # the tax where profitable, matching the economic intuition
+            # of a carbon tax as a price ceiling.
             eq_ctax = Equation(m, name="eq_ctax",
                                domain=[t_set, n_set, ghg_set])
             eq_ctax[t_set, n_set, ghg_set].where[par_ctax[t_set, ghg_set] > 0] = (
-                MAC[t_set, n_set, ghg_set] == par_ctax[t_set, ghg_set]
+                MAC[t_set, n_set, ghg_set] <= par_ctax[t_set, ghg_set]
             )
             equations.append(eq_ctax)
 
@@ -419,16 +494,40 @@ def define_eqs(m, sets, params, cfg, v):
             equations.append(eq_pledges_co2)
 
             # ----------------------------------------------------------
-            # Issue 5: GHG pledge constraint (all greenhouse gases)
-            # GAMS: eq_long_term_pledges_ghg(t,n)$(...) ..
-            #   sum(ghg, EIND(t,n,ghg) * emi_gwp(ghg)) - ELAND(t,n) =L= 0
+            # GHG pledge constraint (all greenhouse gases)
+            # GAMS core_policy.gms line 233: long_term_pledges_year_ghg(n) = 2310
+            # GAMS line 236: Carbon neutral loading is COMMENTED OUT.
+            # Therefore GHG constraint is effectively disabled by default
+            # (2310 is past the model horizon of 2300).
+            # Use a SEPARATE indicator from CO2 pledges.
+            # GAMS: eq_long_term_pledges_ghg(t,n)$(year(t) ge long_term_pledges_year_ghg(n))..
+            #   sum(ghg, EIND(t,n,ghg) * emi_gwp(ghg)) - ELAND(t,n) =L= EPS
             # ----------------------------------------------------------
             EIND = v["EIND"]
             par_emi_gwp = params.get("par_emi_gwp")
-            if par_emi_gwp is not None:
+            pledge_years_ghg = params.get("par_pledge_nz_year_ghg")
+            if par_emi_gwp is not None and pledge_years_ghg is not None:
+                # Build separate GHG pledge indicator
+                nz_year_ghg_dict = {}
+                if hasattr(pledge_years_ghg, 'records') and pledge_years_ghg.records is not None:
+                    for _, row in pledge_years_ghg.records.iterrows():
+                        nz_year_ghg_dict[row.iloc[0]] = row.iloc[1]
+
+                ghg_pledge_active_records = []
+                for t in range(1, cfg.T + 1):
+                    yr = cfg.year(t)
+                    for rname in nz_year_ghg_dict:
+                        nz_yr = nz_year_ghg_dict[rname]
+                        if yr >= nz_yr:
+                            ghg_pledge_active_records.append((str(t), rname, 1.0))
+
+                par_ghg_pledge_active = Parameter(
+                    m, name="ghg_pledge_active", domain=[t_set, n_set],
+                    records=ghg_pledge_active_records if ghg_pledge_active_records else None)
+
                 eq_pledges_ghg = Equation(
                     m, name="eq_pledges_ghg", domain=[t_set, n_set], type="leq")
-                eq_pledges_ghg[t_set, n_set].where[par_pledge_active[t_set, n_set] > 0] = (
+                eq_pledges_ghg[t_set, n_set].where[par_ghg_pledge_active[t_set, n_set] > 0] = (
                     Sum(ghg_set, EIND[t_set, n_set, ghg_set] * par_emi_gwp[ghg_set])
                     - ELAND[t_set, n_set] <= 0
                 )
@@ -495,25 +594,42 @@ def define_eqs(m, sets, params, cfg, v):
                 burden_shares[r] = region_emi.get(r, 0) / total_emi if total_emi > 0 else 1.0 / len(region_names)
 
         elif cfg.burden == "historical_responsibility":
-            # Proxy for historical responsibility: use cumulative BAU emissions
-            # at t=1..2 as a stand-in for GAMS PRIMAP data (1960-2010).
-            # GAMS: carbon_debt weighted average with population.
-            # Here we combine each region's share of early-period BAU CO2
-            # emissions as a proxy for historical cumulative emissions.
-            par_emi_bau = params["par_emi_bau"]
-            total_emi = 0
-            region_emi = {r: 0.0 for r in region_names}
-            if hasattr(par_emi_bau, 'records') and par_emi_bau.records is not None:
-                for _, row in par_emi_bau.records.iterrows():
-                    t_str = str(row.iloc[0])
-                    ghg_str = str(row.iloc[2]).lower()
-                    if t_str in ("1", "2") and ghg_str == "co2":
-                        r = str(row.iloc[1])
-                        v_val = float(row.iloc[3])
-                        region_emi[r] = region_emi.get(r, 0) + v_val
-                        total_emi += v_val
-            for r in region_names:
-                burden_shares[r] = region_emi.get(r, 0) / total_emi if total_emi > 0 else 1.0 / len(region_names)
+            # GAMS core_policy.gms lines 252-258:
+            #   carbon_debt(n) = sum(yearlu 1960..2010,
+            #     l_wdi(yearlu,n) * global_avg_emi_per_worker(yearlu)
+            #     - q_emi_primap('co2ffi',yearlu,n))
+            #   burden_share(n) = (epc_share + carbon_debt_share) / 2
+            carbon_debt = params.get("_carbon_debt_by_region", {})
+
+            if carbon_debt:
+                # Equal-per-capita share (same as equal_per_capita burden)
+                total_pop = 0
+                region_pop = {r: 0.0 for r in region_names}
+                pop_recs = params["par_pop"].records
+                for t in range(1, min(cfg.T + 1, 19)):
+                    for r in region_names:
+                        p_row = pop_recs[(pop_recs["t"] == str(t)) & (pop_recs["n"] == r)]
+                        if len(p_row) > 0:
+                            pv = p_row.iloc[0, -1]
+                            region_pop[r] += pv
+                            total_pop += pv
+                epc_shares = {}
+                for r in region_names:
+                    epc_shares[r] = region_pop[r] / total_pop if total_pop > 0 else 1.0 / len(region_names)
+
+                # Carbon debt share
+                total_debt = sum(carbon_debt.values())
+                debt_shares = {}
+                for r in region_names:
+                    debt_shares[r] = carbon_debt.get(r, 0.0) / total_debt if total_debt != 0 else 1.0 / len(region_names)
+
+                # Average of EPC and carbon debt shares (GAMS line 258)
+                for r in region_names:
+                    burden_shares[r] = (epc_shares.get(r, 0) + debt_shares.get(r, 0)) / 2
+            else:
+                # Fallback to equal shares if PRIMAP/WDI data unavailable
+                for r in region_names:
+                    burden_shares[r] = 1.0 / len(region_names)
 
         elif cfg.burden == "cost_efficiency":
             # cost_efficiency: very large share (makes regional constraint non-binding,

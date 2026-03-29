@@ -1,12 +1,12 @@
-# PyDICE32
+# PyDICE32 v0.7.0
 
-Python/GAMSPy implementation of the [RICE50x](https://github.com/witch-team/RICE50xmodel) integrated assessment model with 32 GCAM v8+ regions.
+Python/GAMSPy port of the [RICE50x](https://github.com/witch-team/RICE50xmodel) integrated assessment model, re-aggregated to 32 GCAM v8+ regions.
 
 ## Overview
 
-PyDICE32 translates the GAMS-based RICE50x model into a modular Python package using [GAMSPy](https://gamspy.readthedocs.io/). The model aggregates 155 ISO3 countries into 32 [GCAM v8+](https://jgcri.github.io/gcam-doc/) regions and solves a Ramsey-type optimal growth model coupled with a climate system, damage functions, and abatement cost curves.
+PyDICE32 is a partial translation of the GAMS-based RICE50x model into Python using [GAMSPy](https://gamspy.readthedocs.io/). The model aggregates 155 ISO3 countries into 32 [GCAM v8+](https://jgcri.github.io/gcam-doc/) regions.
 
-Modular architecture with ~110 equations verified against the native GAMS source.
+**This is not a literal 1:1 port.** The core economy-emissions-welfare-abatement stack is closely translated, but optional modules have varying fidelity and several source branches are not yet implemented. See the [Coverage](#coverage) section for details.
 
 ![Global CO2 Emission Pathways](docs/spaghetti_emissions.png)
 
@@ -29,14 +29,21 @@ Modular architecture with ~110 equations verified against the native GAMS source
 | `long_term_pledges` | Per-country net-zero pledges (Paris Agreement) |
 | `simulation` | Fixed MIU=0, no mitigation |
 
-### Damage Functions (3)
+### Damage Functions (7)
 - **DICE** — Nordhaus (2018) quadratic temperature-level damages
 - **Kalkuhl** — Kalkuhl & Wenz (2020) growth-rate damages (simple + full omega)
 - **Burke** — Burke, Hsiang & Miguel (2015) with sr/lr/srdiff/lrdiff specifications
+- **Howard** — Howard & Sterner (2017) meta-analysis quadratic damages
+- **Dell** — Dell, Jones & Olken (2012) growth-rate with rich/poor differentiation
+- **COACCH** — van der Wijst et al. (2023) regional polynomial with quantile uncertainty
+- **CLIMCOST** — EU CLIMCOST project (uses COACCH module with different coefficients)
 
-### Climate Modules (2)
-- **WITCH-CO2** — 3-box carbon cycle with 2-layer temperature (default)
+### Climate Modules (3 of 4 source modules)
+- **WITCH-CO2** — 3-box carbon cycle with 2-layer temperature
 - **FAIR** — Impulse response model with 20 equations (Smith et al., 2018)
+- **tatm_exogen** — Exogenous temperature path simulation (via `cfg.tatm_exogen_path`)
+
+Not implemented: `witchghg` (multi-GHG WITCH).
 
 ### Social Welfare Functions (3)
 - **Disentangled** — Berger & Emmerling (2020) equity-equivalents (default)
@@ -51,20 +58,30 @@ CO2, CH4, N2O with species-specific:
 - Emission quantity/cost unit conversion (convq_ghg, convy_ghg)
 
 ### Solve Modes
-- **Single-pass** — Fast cooperative optimization (default)
-- **Cooperative iterative** — Multi-iteration with Negishi weight updates, DAC learning
-- **Nash non-cooperative** — Per-coalition best-response with convergence tracking
+- **Single-pass** — Fast cooperative optimization
+- **Cooperative iterative** — Multi-iteration with Negishi weight updates, DAC learning (default for non-BAU)
+- **Nash non-cooperative** — Per-region best-response with convergence tracking
+
+Note: `coalitions` mode requires user-defined `coalition_def` (dict or JSON file via `--coalition-def`). GAMS preset coalition files are not ported. Without `coalition_def`, falls back to `noncoop`.
 
 ### Extension Modules
-| Module | Description |
-|--------|-------------|
-| DAC | Direct air capture with learning curve and CCS storage costs |
-| SAI | Stratospheric aerosol injection (g0 uniform + g6 multi-latitude emulator) |
-| Adaptation | CES-nested adaptive capacity (proactive, reactive, specific, generic) |
-| Ocean | Ocean capital ecosystem services (coral, mangrove, fisheries) |
-| Natural capital | Green/blue capital in production and utility |
-| Inequality | Within-country income distribution by deciles |
-| Sea-level rise | Thermal expansion + ice sheet dynamics with economic feedback |
+| Module | Status | Description |
+|--------|--------|-------------|
+| DAC + CCS Storage | translated | Direct air capture with learning curve, per-type CCS storage, cumulative tracking, leakage |
+| SAI | partial | g0 uniform + g6 emulator; `can_deploy` gate implemented, `sovereign`/`eqsym_sai` not yet |
+| Adaptation | translated | CES-nested adaptive capacity with per-region exponents and OMEGA>0 gate |
+| Ocean | translated | Coral, mangrove, fisheries ecosystem services; VSL/mangrove use YNET.l pattern |
+| Natural capital | partial | Production function path implemented; `nat_cap_prodfun` TFP branch not yet ported |
+| Inequality | partial | Core decile accounting; `transfer="opt"` and `omegacalib` paths not yet ported |
+| Sea-level rise | translated | Thermal expansion + ice sheet dynamics |
+| Labour | stub | Not implemented |
+
+### Source Modules Not Ported
+| Source module | Notes |
+|---------------|-------|
+| `mod_climate_witchghg` | Multi-GHG WITCH climate (FAIR covers same functionality) |
+| `mod_impact_sai` | SAI-specific Burke+Kotz+precipitation damage function |
+| `mod_emission_pulse` | GAMS-style SCC module (replaced by `scc.py` Python implementation) |
 
 ## Installation
 
@@ -152,30 +169,32 @@ pydice32/
 ├── solver.py                  # Model assembly + single-pass/iterative/Nash solve
 ├── report.py                  # Result extraction and printing
 ├── batch_run.py               # Multi-scenario batch runner
+├── batch_run_reuse.py         # Batch runner with MACC reuse (build once per family)
 ├── data/
 │   ├── loader.py              # CSV I/O utilities
 │   ├── gcam_mapping.py        # 155 ISO3 → 32 GCAM region aggregation
 │   ├── calibration.py         # TFP, savings, sigma, MACC, climate parameters
 │   └── sai_emulator_data.py   # SAI g6 regional response synthesis
-└── modules/                   # 1:1 mapping with GAMS .gms files
+└── modules/                   # Translated from GAMS .gms files (see Coverage)
     ├── core_economy.py        # Cobb-Douglas production, capital, consumption
     ├── core_emissions.py      # Multi-GHG emissions with MIU inertia
     ├── core_abatement.py      # MACC polynomial cost curves
     ├── core_welfare.py        # Disentangled / DICE / Stochastic SWF
-    ├── core_policy.py         # 11 policy constraint equations
+    ├── core_policy.py         # 11 policy constraints + NDC (merged from pol_ndc.gms)
     ├── hub_climate.py         # WITCH-CO2 carbon cycle + temperature
     ├── hub_impact.py          # Damage fraction with cap, adaptation, SLR
-    ├── mod_climate_fair.py    # FAIR impulse response (20 equations)
-    ├── mod_climate_regional.py # Regional temperature downscaling
+    ├── mod_climate_fair.py    # FAIR impulse response
+    ├── mod_climate_regional.py # Regional temp + precip downscaling
     ├── mod_impact_dice.py     # DICE quadratic damage
     ├── mod_impact_kalkuhl.py  # Kalkuhl growth-rate damage + full omega
     ├── mod_impact_burke.py    # Burke level damage + differentiated specs
     ├── mod_landuse.py         # Land-use emissions and abatement
     ├── mod_dac.py             # Direct air capture with learning
+    ├── mod_emi_stor.py        # CCS storage (per-type, cumulative, leakage)
     ├── mod_sai.py             # SAI geoengineering (g0 + g6)
     ├── mod_adaptation.py      # CES adaptive capacity
     ├── mod_ocean.py           # Ocean ecosystem services
-    ├── mod_natural_capital.py # Natural capital in production
+    ├── mod_natural_capital.py # Natural capital in production + utility
     ├── mod_inequality.py      # Decile income distribution
     ├── mod_slr.py             # Sea-level rise components
     └── mod_labour.py          # Labour market (stub)
@@ -184,6 +203,56 @@ pydice32/
 Each module follows a two-pass pattern mirroring GAMS phases:
 1. `declare_vars()` — Create variables, set bounds and starting values
 2. `define_eqs()` — Create equations referencing cross-module variables
+
+## Coverage
+
+Translation fidelity relative to [RICE50xmodel](https://github.com/witch-team/RICE50xmodel):
+
+| Category | Status |
+|----------|--------|
+| Core economy/emissions/welfare/abatement | Closely translated |
+| Policies (11 modes) | Translated; fiscal revenue approach active by default (GAMS-aligned) |
+| DICE/Kalkuhl/Burke damage functions | Translated |
+| WITCH-CO2 climate | Translated (merged into hub_climate) |
+| FAIR climate | Translated; FF_CH4 endogenous, o3trop emissions terms included |
+| Regional climate downscaling | Translated (temp + precip) |
+| DAC + CCS Storage | Translated (per-type storage, leakage) |
+| SAI | Partial (g0/g6 work; `sovereign`/`eqsym_sai` missing) |
+| Adaptation | Translated (per-region CES exp, OMEGA>0 gate) |
+| Ocean | Translated (YNET.l pattern for VSL/mangrove) |
+| Sea-level rise | Translated |
+| Natural capital | Partial (`nat_cap_prodfun` TFP branch missing) |
+| Inequality | Partial (`transfer="opt"`, `omegacalib` missing) |
+| Cooperation: coop/noncoop | Translated |
+| Cooperation: coalitions | Partial (user-defined coalition_def; no GAMS preset library) |
+| tatm_exogen, dell, howard, coacch, climcost, deciles | Translated |
+| SCC (emission_pulse) | Translated (Python `scc.py`, not GAMS module) |
+| WITCH-GHG, mod_impact_sai | Not implemented |
+
+## Default Differences from GAMS
+
+| Setting | GAMS default | PyDICE32 default | Reason |
+|---------|-------------|------------------|--------|
+| `climate` | `fair` | `witchco2` | Simpler default for initial testing |
+| `cooperation` | `noncoop` | `coop` | Single-pass cooperative is faster |
+| `ctax_marginal` | OFF (commented out) | `False` (aligned) | Fiscal revenue approach |
+| `sai_experiment` | `g6` | `g6` (aligned) | |
+| `sai_start` | 2035 | 2035 (aligned) | |
+| `can_deploy` | `no` | `no` (aligned) | |
+| `nat_cap_utility` | OFF | `False` (aligned) | |
+
+## Batch Mode with MACC Reuse
+
+For scenarios differing only in `macc_costs` (prob25/prob50/prob75), `batch_run_reuse.py` builds the GAMSPy model once per policy/impact family and swaps MACC parameters via `setRecords()` for re-solve with warm start.
+
+Measured performance (ctax + kalkuhl family, 3 MACC variants):
+- Fresh build+solve: ~137s
+- MACC swap+re-solve: ~6-9s each (warm start)
+- 3-run family total: ~152s vs ~411s naive (63% reduction)
+
+```bash
+python -m pydice32.batch_run_reuse
+```
 
 ## References
 

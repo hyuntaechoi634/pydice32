@@ -127,27 +127,56 @@ def declare_vars(m, sets, params, cfg, v):
     # GAMS: I_CDR.up = 30 / c2co2  (investment upper bound)
     I_CDR.up[t_set, n_set] = 30.0 / CtoCO2
 
-    # GAMS: E_NEG.up based on regional share of global MAX_CDR.
-    # Uses population-based burden sharing (GAMS line 158):
-    #   E_NEG.up(t,n) = pop('2',n)/sum(nn,pop('2',nn)) * totcapstor/5697 * max_cdr
-    # Simplified: use pop share * MAX_CDR as upper bound (totcapstor/5697 ≈ 1).
-    par_pop = params["par_pop"]
-    pop_records = par_pop.records
-    if pop_records is not None and not pop_records.empty:
-        pop_t2 = pop_records[pop_records.iloc[:, 0] == "2"]
-        if not pop_t2.empty:
-            total_pop = pop_t2["value"].sum()
-            for _, row in pop_t2.iterrows():
-                region = row.iloc[1]
-                share = row["value"] / total_pop if total_pop > 0 else 0
-                E_NEG.up[t_set, region] = share * MAX_CDR
+    # GAMS mod_dac.gms: E_NEG.up based on geological storage capacity share.
+    # capstorreg(n) = sum(ccs_stor, ccs_stor_cap_max(n, ccs_stor)) / c2co2
+    # Reuse _load_storage_data from mod_emi_stor which correctly derives
+    # per-type capacity (deducting EOR from O&G to avoid double-counting).
+    from pydice32.modules.mod_emi_stor import _load_storage_data, CCS_STOR_TYPES
+    from pydice32.data.gcam_mapping import load_rice_regions, load_gcam_mapping, load_gcam_region_names
+    region_names = [str(r) for r in n_set.records.iloc[:, 0]]
+    ccs_loaded = False
+
+    try:
+        rice_regions = load_rice_regions(cfg.project_root)
+        gcam_map = load_gcam_mapping(cfg.gcam_csv, set(rice_regions))
+        gcam_nm = load_gcam_region_names(cfg.gcam_names_csv)
+    except Exception:
+        gcam_map, gcam_nm = {}, {}
+
+    stor_data = _load_storage_data(cfg.data_dir, region_names, cfg.SSP, gcam_map, gcam_nm,
+                                       cap_override=getattr(cfg, "ccs_stor_cap_max", None) or None)
+    cap_max = stor_data.get("cap_max", {})
+    # capstorreg = sum of all per-type capacities (already in GtCO2 from _load_storage_data)
+    capstorreg = {}
+    for r in region_names:
+        total = sum(cap_max.get((r, st), 0.0) for st in CCS_STOR_TYPES)
+        if total > 0:
+            capstorreg[r] = total / CtoCO2  # GtCO2 -> GtC for DAC bounds
+            ccs_loaded = True
+
+    if ccs_loaded and capstorreg:
+        totcapstor = sum(capstorreg.values())
+        for r in region_names:
+            share = capstorreg.get(r, 0.0) / totcapstor if totcapstor > 0 else 0
+            E_NEG.up[t_set, r] = share * MAX_CDR
+    else:
+        # Fallback: population-based sharing (GAMS 'epc' path)
+        par_pop = params["par_pop"]
+        pop_records = par_pop.records
+        if pop_records is not None and not pop_records.empty:
+            pop_t2 = pop_records[pop_records.iloc[:, 0] == "2"]
+            if not pop_t2.empty:
+                total_pop = pop_t2["value"].sum()
+                for _, row in pop_t2.iterrows():
+                    region = row.iloc[1]
+                    share = row["value"] / total_pop if total_pop > 0 else 0
+                    E_NEG.up[t_set, region] = share * MAX_CDR
+            else:
+                n_regions = len(n_set.records) if n_set.records is not None else 32
+                E_NEG.up[t_set, n_set] = MAX_CDR / n_regions
         else:
-            # Fallback: equal share
             n_regions = len(n_set.records) if n_set.records is not None else 32
             E_NEG.up[t_set, n_set] = MAX_CDR / n_regions
-    else:
-        n_regions = len(n_set.records) if n_set.records is not None else 32
-        E_NEG.up[t_set, n_set] = MAX_CDR / n_regions
 
     # GAMS: I_CDR.up(t,n)$(year(t) gt 2100) = 0  (no investment after 2100)
     # period 18 = year 2100; periods 19+ = year > 2100
@@ -155,9 +184,13 @@ def declare_vars(m, sets, params, cfg, v):
     for t_idx in range(19, T + 1):
         I_CDR.up[str(t_idx), n_set] = 0
 
-    # GAMS: E_NEG.up(t,n)$(year(t) le 2020) = small value (early-period cap)
-    # periods 1 and 2 correspond to 2015, 2020
-    E_NEG.up["2", n_set] = 1e-3
+    # GAMS: E_NEG.up(t,n)$(year(t) le 2020) = 1e-3 * capstorreg(n)/totcapstor
+    if ccs_loaded and capstorreg and totcapstor > 0:
+        for r in region_names:
+            share = capstorreg.get(r, 0.0) / totcapstor
+            E_NEG.up["2", r] = 1e-3 * share
+    else:
+        E_NEG.up["2", n_set] = 1e-3
 
     # GAMS: COST_CDR.up = 0.25 * ykali for stability
     par_ykali = params["par_ykali"]
@@ -241,15 +274,30 @@ def define_eqs(m, sets, params, cfg, v):
     # GAMS mod_dac.gms line 211-213:
     #   COST_CDR(t,n) = I_CDR(t,n) + E_NEG(t,n) * dac_totcost * (1-capex)
     #                 + sum(ccs_stor, E_STOR(ccs_stor,t,n) * ccs_stor_cost(ccs_stor,n)) * CtoCO2
-    # Simplified: all captured CO2 stored at average cost.
-    # E_STOR total = E_NEG / CtoCO2 (GtC), so storage cost = E_NEG * avg_ccs_stor_cost.
     eq_cost_cdr = Equation(m, name="eq_cost_cdr", domain=[t_set, n_set])
-    eq_cost_cdr[t_set, n_set] = (
-        COST_CDR[t_set, n_set]
-        == I_CDR[t_set, n_set]
-        + E_NEG[t_set, n_set] * dac_totcost * (1.0 - CAPEX)
-        + E_NEG[t_set, n_set] * avg_ccs_stor_cost
-    )
+    # Use per-type E_STOR if mod_emi_stor is active, else fallback to average cost
+    if "E_STOR" in v and "par_ccs_stor_cost" in params:
+        from gamspy import Sum as GSum
+        E_STOR = v["E_STOR"]
+        ccs_stor_set = v.get("_ccs_stor_set", sets.get("ccs_stor"))
+        par_stor_cost = params["par_ccs_stor_cost"]
+        eq_cost_cdr[t_set, n_set] = (
+            COST_CDR[t_set, n_set]
+            == I_CDR[t_set, n_set]
+            + E_NEG[t_set, n_set] * dac_totcost * (1.0 - CAPEX)
+            + GSum(ccs_stor_set,
+                   E_STOR[ccs_stor_set, t_set, n_set] * par_stor_cost[ccs_stor_set])
+            * CtoCO2
+        )
+    else:
+        # Fallback: average storage cost (no mod_emi_stor)
+        avg_ccs_stor_cost = _load_avg_ccs_stor_cost(cfg.data_dir)
+        eq_cost_cdr[t_set, n_set] = (
+            COST_CDR[t_set, n_set]
+            == I_CDR[t_set, n_set]
+            + E_NEG[t_set, n_set] * dac_totcost * (1.0 - CAPEX)
+            + E_NEG[t_set, n_set] * avg_ccs_stor_cost
+        )
     equations.append(eq_cost_cdr)
 
     # eq_mkt_growth_dac: growth constraint

@@ -34,11 +34,13 @@ from pydice32.data import load_and_calibrate
 from pydice32.modules import (
     core_economy, core_emissions, core_abatement, core_welfare,
     hub_climate, hub_impact, mod_impact_dice, mod_impact_kalkuhl,
-    mod_impact_burke, mod_climate_regional, mod_climate_fair,
+    mod_impact_burke, mod_impact_howard, mod_impact_dell, mod_impact_coacch,
+    mod_impact_deciles,
+    mod_climate_regional, mod_climate_fair, mod_climate_tatm_exogen,
     mod_landuse, core_policy,
 )
 from pydice32.modules import (
-    mod_dac, mod_sai, mod_adaptation,
+    mod_dac, mod_emi_stor, mod_sai, mod_adaptation,
     mod_ocean, mod_natural_capital, mod_inequality, mod_labour, mod_slr,
 )
 
@@ -111,6 +113,30 @@ def solve_model(rice, cfg: Config):
     return rice
 
 
+def update_macc_params(data, macc_bundle):
+    """Swap MACC parameters in an existing model for batch re-solve.
+
+    Parameters
+    ----------
+    data : dict
+        The data dict from build_model(), containing '_params' with
+        par_macc_c1 and par_macc_c4 GAMSPy Parameters.
+    macc_bundle : dict
+        Output of compute_macc_bundle(): {'macc_c1': {...}, 'macc_c4': {...}}
+    """
+    p = data["_params"]
+    par_c1 = p["par_macc_c1"]
+    par_c4 = p["par_macc_c4"]
+    c1 = macc_bundle["macc_c1"]
+    c4 = macc_bundle["macc_c4"]
+
+    c1_records = [(str(t), r, g, v) for (t, r, g), v in c1.items()]
+    c4_records = [(str(t), r, g, v) for (t, r, g), v in c4.items()]
+
+    par_c1.setRecords(c1_records)
+    par_c4.setRecords(c4_records)
+
+
 # ---------------------------------------------------------------------------
 #  Iterative cooperative solve  (mirrors GAMS algorithm/solve_regions.gms)
 # ---------------------------------------------------------------------------
@@ -141,6 +167,14 @@ def solve_model_iterative(m, rice, v, data, cfg):
     """
     # D1: Non-cooperative and coalition modes should use Nash solver.
     # "coop" and cooperative-iterative modes (e.g. "coop_iterative") stay here.
+    if cfg.cooperation == "coalitions" and getattr(cfg, "coalition_def", None) is None:
+        import warnings
+        warnings.warn(
+            "Coalitions mode without coalition_def falls back to noncoop "
+            "(one region per coalition). Set cfg.coalition_def to a dict "
+            "or JSON path to define multi-region coalitions.",
+            UserWarning,
+        )
     if cfg.cooperation in ("noncoop", "coalitions"):
         return solve_model_nash(m, rice, v, data, cfg)
 
@@ -394,17 +428,40 @@ def _before_solve(m, v, data, cfg, iteration):
     if cfg.savings_mode == "flexible" and iteration > 1:
         _update_savings_terminal(v, data, cfg)
 
-    # --- ctax corrected update ---
-    # GAMS core_policy.gms before_solve updates ctax_corrected from
-    # current E.l levels. This matters for the fiscal revenue approach.
-    # For ctax_marginal mode, ctax_corrected is a fixed schedule, so
-    # no update is needed. The fiscal approach is future work.
+    # --- Fiscal revenue updates (ctax_corrected + E.l) ---
+    # GAMS core_policy.gms before_solve:
+    #   ctax_corrected(t,n,ghg) = min(ctax*1e3*emi_gwp(ghg), cprice_max(t,n,ghg))
+    #   if tax_oghg_as_co2: ctax_corrected(non-co2) = min(MAC.l(co2)*emi_gwp, cprice_max)
+    # Also update par_emi_level to E.l for fiscal revenue term in eq_yy.
+    if cfg.policy in ("ctax", "cbudget_regional") and not cfg.ctax_marginal and iteration > 1:
+        _update_fiscal_revenue(v, data, cfg, iteration)
 
     # D8: Update cprice_max from current MAC levels (for ctax policy).
-    # GAMS before_solve: cprice_max(t,n) = max(cprice_max(t,n), MAC.l(t,n,'co2'))
-    # This ensures the upper bound on carbon price tracks the solved MAC.
-    if cfg.policy == "ctax" and "MAC" in v and iteration > 1:
+    if cfg.policy in ("ctax", "cbudget_regional") and "MAC" in v and iteration > 1:
         _update_cprice_max(v, data, cfg)
+
+    # --- NDC MAC.lo extrapolation + ctax_corrected recomputation ---
+    # GAMS pol_ndc.gms before_solve: re-extrapolate MAC.lo post-2030 using
+    # current MAC.l('4') values, then recompute ctax_corrected.
+    # This is critical for long_term_pledges policy with iterative solver.
+    if cfg.policy == "long_term_pledges" and getattr(cfg, "pol_ndc", False) and iteration > 1:
+        _update_ndc_mac_extrap(v, data, cfg)
+
+    # --- Ocean YNET.l update ---
+    # GAMS mod_ocean.gms: VSL and mangrove valuation use YNET.l
+    if cfg.ocean and "YNET" in v and iteration > 1:
+        YNET = v["YNET"]
+        par_ynet_lev = data.get("_params", {}).get("par_ynet_level")
+        if par_ynet_lev is not None and YNET.records is not None and len(YNET.records) > 0:
+            new_recs = [(str(row.iloc[0]), str(row.iloc[1]), row["level"])
+                        for _, row in YNET.records.iterrows()]
+            par_ynet_lev.setRecords(new_recs)
+
+    # --- Adaptation OMEGA gate update ---
+    # GAMS hub_impact.gms: $(OMEGA.l(t,n) gt 0) controls whether adaptation
+    # divisor is applied. Update par_omega_positive from solved OMEGA.l.
+    if cfg.adaptation and "OMEGA" in v and iteration > 1:
+        _update_omega_gate(v, data, cfg)
 
     # D9: Update TEMP_REGION starting values from current TATM levels
     # to provide better initial guesses for the NLP solver.
@@ -508,6 +565,194 @@ def _update_savings_terminal(v, data, cfg):
                 S.fx[str(t), r] = s_ref[r]
 
 
+def _update_omega_gate(v, data, cfg):
+    """Update par_omega_positive from solved OMEGA.l values.
+
+    GAMS hub_impact.gms line 97: $(OMEGA.l(t,n) gt 0) gates the adaptation
+    divisor. When OMEGA.l <= 0 (warming benefit), adaptation is not applied.
+    """
+    OMEGA = v.get("OMEGA")
+    if OMEGA is None or OMEGA.records is None or len(OMEGA.records) == 0:
+        return
+
+    par_omega_pos = data.get("_params", {}).get("par_omega_positive")
+    if par_omega_pos is None:
+        return
+
+    new_records = []
+    for _, row in OMEGA.records.iterrows():
+        t_str = str(row.iloc[0])
+        n_str = str(row.iloc[1])
+        omega_val = row["level"]
+        new_records.append((t_str, n_str, 1.0 if omega_val > 0 else 0.0))
+
+    par_omega_pos.setRecords(new_records)
+
+
+def _update_fiscal_revenue(v, data, cfg, iteration):
+    """Update par_emi_level to E.l and ctax_corrected for fiscal revenue.
+
+    GAMS core_policy.gms before_solve:
+      ctax_corrected(t,n,ghg) = min(ctax*1e3*emi_gwp(ghg), cprice_max(t,n,ghg))
+      if tax_oghg_as_co2: ctax_corrected(non-co2) = min(MAC.l(co2)*emi_gwp, cprice_max)
+    Also for cbudget_regional + cost_efficiency: iterative ctax_var adjustment.
+    """
+    p = data.get("_params", {})
+    E = v.get("E")
+    MAC = v.get("MAC")
+
+    # --- Update par_emi_level to current E.l ---
+    par_emi_level = p.get("par_emi_level")
+    if par_emi_level is not None and E is not None and E.records is not None and len(E.records) > 0:
+        new_records = []
+        for _, row in E.records.iterrows():
+            new_records.append((str(row.iloc[0]), str(row.iloc[1]),
+                                str(row.iloc[2]), row["level"]))
+        par_emi_level.setRecords(new_records)
+
+    # --- cbudget_regional + cost_efficiency: iterative ctax_var adjustment ---
+    # GAMS core_policy.gms lines 423-457: adjust ctax_var to hit carbon budget
+    if cfg.policy == "cbudget_regional" and cfg.burden == "cost_efficiency" and iteration > 1:
+        # Compute current cbudget_2020_2100 from E.l
+        if E is not None and E.records is not None and len(E.records) > 0:
+            region_names = data.get("region_names", [])
+            e_levels = {}
+            for _, row in E.records.iterrows():
+                key = (str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))
+                e_levels[key] = row["level"]
+
+            cbudget_actual = 0.0
+            for t in range(3, cfg.T + 1):  # year(t) > 2020 and year(t) <= 2095
+                yr = cfg.year(t)
+                if yr > 2020 and yr <= 2095:
+                    for r in region_names:
+                        cbudget_actual += e_levels.get((str(t), r, "co2"), 0.0) * cfg.TSTEP
+            # + 3.5 * E('2',n,'co2')
+            for r in region_names:
+                cbudget_actual += 3.5 * e_levels.get(("2", r, "co2"), 0.0)
+            # + 2.5 * E at year 2100 (t=18)
+            for r in region_names:
+                cbudget_actual += 2.5 * e_levels.get(("18", r, "co2"), 0.0)
+
+            ctax_target = cfg.cbudget
+            conv_budget = getattr(cfg, "conv_budget", 1.0)
+
+            ctax_var = data.get("_ctax_var")
+            if ctax_var is None:
+                # Initialize: GAMS formula
+                import math
+                ctax_var = max(581.12 - 74.3 * math.log(ctax_target), 1.0)
+
+            if abs(cbudget_actual - ctax_target) > conv_budget:
+                ratio = min((6000 - ctax_target) / max(6000 - cbudget_actual, 1), 3)
+                ctax_var = ctax_var * ratio ** 2.2
+
+            if ctax_var > 10000:
+                print(f"  WARNING: ctax_var={ctax_var:.1f} exceeds 10000, clamping")
+                ctax_var = 10000
+            data["_ctax_var"] = ctax_var
+
+            # Recompute tax schedule and ctax_corrected
+            _recompute_ctax_schedule(v, p, data, cfg, ctax_var)
+
+    # Initialize ctax_schedule if not yet set
+    if "_ctax_schedule" not in data:
+        tax_schedule = {}
+        ctax_init = data.get("_ctax_var", cfg.ctax_initial)
+        for t in range(1, cfg.T + 1):
+            yr = cfg.year(t)
+            if yr >= cfg.ctax_start:
+                effective_yr = min(yr, 2100)
+                tax = (ctax_init / 1000.0) * (1 + cfg.ctax_slope) ** (effective_yr - cfg.ctax_start)
+            else:
+                tax = 1e-8
+            tax_schedule[t] = tax
+        # Cap post-2100 at 2100 value
+        t2100 = (2100 - 2015) // cfg.TSTEP + 1
+        for t in range(t2100 + 1, cfg.T + 1):
+            tax_schedule[t] = tax_schedule.get(t2100, tax_schedule[t])
+        data["_ctax_schedule"] = tax_schedule
+
+    # --- Update ctax_corrected from current MAC.l ---
+    # GAMS: ctax_corrected = min(ctax*1e3*emi_gwp, cprice_max)
+    # With tax_oghg_as_co2: non-CO2 uses MAC.l(co2)*emi_gwp
+    par_ctax_corr = v.get("par_ctax_corrected")
+    if par_ctax_corr is not None and MAC is not None and MAC.records is not None:
+        mac_co2_levels = {}  # (t, n) -> MAC.l for CO2
+        for _, row in MAC.records.iterrows():
+            if str(row.iloc[2]) == "co2":
+                mac_co2_levels[(str(row.iloc[0]), str(row.iloc[1]))] = row["level"]
+
+        emi_gwp = {"co2": 1.0, "ch4": 28.0, "n2o": 265.0}
+        par_emi_gwp = p.get("par_emi_gwp")
+        if par_emi_gwp is not None and hasattr(par_emi_gwp, 'records') and par_emi_gwp.records is not None:
+            for _, row in par_emi_gwp.records.iterrows():
+                emi_gwp[str(row.iloc[0]).lower()] = float(row.iloc[1])
+
+        # Read cprice_max (MAC at MIU.up)
+        macc_c1_p = p.get("par_macc_c1")
+        macc_c4_p = p.get("par_macc_c4")
+        maxmiu_p = p.get("par_maxmiu_pbl")
+        cp_max_dict = {}
+        if macc_c1_p is not None and macc_c4_p is not None and maxmiu_p is not None:
+            c1d, c4d, mud = {}, {}, {}
+            for _, r in macc_c1_p.records.iterrows():
+                c1d[(str(r.iloc[0]), str(r.iloc[1]), str(r.iloc[2]))] = float(r.iloc[3])
+            for _, r in macc_c4_p.records.iterrows():
+                c4d[(str(r.iloc[0]), str(r.iloc[1]), str(r.iloc[2]))] = float(r.iloc[3])
+            for _, r in maxmiu_p.records.iterrows():
+                mud[(str(r.iloc[0]), str(r.iloc[1]), str(r.iloc[2]))] = float(r.iloc[3])
+            for k in c1d:
+                mu = mud.get(k, 1.0)
+                cp_max_dict[k] = c1d[k] * mu + c4d.get(k, 0) * mu ** 4
+
+        region_names = data.get("region_names", [])
+        new_ctax_records = []
+        for t in range(1, cfg.T + 1):
+            for ghg in cfg.ghg_list:
+                # Base ctax_corrected from tax schedule
+                base = data.get("_ctax_schedule", {}).get(t, 0.0) * 1e3 * emi_gwp.get(ghg, 1.0)
+                # For non-CO2 with tax_oghg_as_co2: use MAC.l(co2) * emi_gwp
+                # averaged across regions as approximation
+                if ghg != "co2":
+                    avg_mac_co2 = 0.0
+                    cnt = 0
+                    for r in region_names:
+                        m_val = mac_co2_levels.get((str(t), r), 0.0)
+                        if m_val > 0:
+                            avg_mac_co2 += m_val
+                            cnt += 1
+                    if cnt > 0:
+                        avg_mac_co2 /= cnt
+                    base = avg_mac_co2 * emi_gwp.get(ghg, 1.0)
+                # Cap at cprice_max (use region-average as approximation for [t, ghg] parameter)
+                cp_vals = [cp_max_dict.get((str(t), r, ghg), 1e6) for r in region_names]
+                cp_avg = sum(cp_vals) / max(len(cp_vals), 1)
+                corrected = min(base, cp_avg)
+                new_ctax_records.append((str(t), ghg, corrected))
+
+        par_ctax_corr.setRecords(new_ctax_records)
+
+
+def _recompute_ctax_schedule(v, p, data, cfg, ctax_var):
+    """Recompute ctax schedule from updated ctax_var (cbudget_regional convergence).
+
+    GAMS core_policy.gms lines 434-455: recompute ctax(t,n) from ctax_var.
+    """
+    tax_schedule = {}
+    for t in range(1, cfg.T + 1):
+        yr = cfg.year(t)
+        if yr >= cfg.ctax_start:
+            effective_yr = min(yr, 2100)
+            tax = (ctax_var / 1000.0) * (1 + cfg.ctax_slope) ** (effective_yr - cfg.ctax_start)
+        else:
+            tax = 1e-8
+        if yr > 2100:
+            tax = tax_schedule.get(18, tax)  # cap at 2100 value (t=18)
+        tax_schedule[t] = tax
+    data["_ctax_schedule"] = tax_schedule
+
+
 def _update_cprice_max(v, data, cfg):
     """D8: Update cprice_max upper bound from current MAC levels.
 
@@ -535,6 +780,62 @@ def _update_cprice_max(v, data, cfg):
             cprice_max[key] = max(old_val, mac_val)
 
     data["_cprice_max"] = cprice_max
+
+
+def _update_ndc_mac_extrap(v, data, cfg):
+    """Re-extrapolate MAC.lo post-2030 from current solved MAC.l levels.
+
+    GAMS pol_ndc.gms before_solve (ndcs_extr="linear"):
+      MAC.lo(t,n,ghg)$(year(t) gt 2030 and MAC.l('4') ne 0) =
+        min(MAC.lo('4') * (1 + slope*(year(t)-2030)), cprice_max(t,n,ghg))
+      ctax_corrected(t,n,ghg) = min(MAC.lo(t,n,ghg), cprice_max(t,n,ghg))
+    """
+    MAC = v.get("MAC")
+    if MAC is None or MAC.records is None or len(MAC.records) == 0:
+        return
+
+    region_names = data.get("region_names", [])
+    p = data.get("_params", {})
+    macc_c1_p = p.get("par_macc_c1")
+    macc_c4_p = p.get("par_macc_c4")
+    maxmiu_p = p.get("par_maxmiu_pbl")
+    if macc_c1_p is None or macc_c4_p is None:
+        return
+
+    # Build lookup dicts
+    c1_dict, c4_dict, miu_up_dict = {}, {}, {}
+    for _, row in macc_c1_p.records.iterrows():
+        c1_dict[(str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))] = float(row.iloc[3])
+    for _, row in macc_c4_p.records.iterrows():
+        c4_dict[(str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))] = float(row.iloc[3])
+    if maxmiu_p is not None and maxmiu_p.records is not None:
+        for _, row in maxmiu_p.records.iterrows():
+            miu_up_dict[(str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))] = float(row.iloc[3])
+
+    # Read current MAC.l at t=4 and t=2
+    mac_l = {}
+    for _, row in MAC.records.iterrows():
+        mac_l[(str(row.iloc[0]), str(row.iloc[1]), str(row.iloc[2]))] = row["level"]
+
+    for rname in region_names:
+        for ghg in cfg.ghg_list:
+            m4 = mac_l.get(("4", rname, ghg), 0.0)
+            m2 = mac_l.get(("2", rname, ghg), 0.0)
+            if m4 == 0:
+                continue
+            slope = (m4 - m2) / (m4 * cfg.TSTEP * 2) if m4 != 0 else 0
+            for t in range(5, cfg.T + 1):
+                yr = cfg.year(t)
+                if yr <= 2030:
+                    continue
+                mac_extrap = m4 * (1 + slope * (yr - 2030))
+                miu_up = miu_up_dict.get((str(t), rname, ghg), 1.0)
+                c1 = c1_dict.get((str(t), rname, ghg), 0.0)
+                c4 = c4_dict.get((str(t), rname, ghg), 0.0)
+                cp_max = c1 * miu_up + c4 * miu_up ** 4
+                mac_floor = min(mac_extrap, cp_max)
+                if mac_floor > 0:
+                    MAC.lo[str(t), rname, ghg] = mac_floor
 
 
 def _update_temp_region_levels(v, data):
@@ -1148,6 +1449,23 @@ _NASH_FIX_VARS_2D = [
     "E_NEG", "I_CDR",        # DAC (mod_dac)
     "N_SAI",                  # SAI (mod_sai)
 ]
+# 3D variables where region is at index 2 (domain: [extra, t, n])
+# These need region-based fixing like _NASH_FIX_VARS_3D but with
+# the extra dimension at position 0 instead of position 2.
+_NASH_FIX_VARS_3D_EXTRA = [
+    "I_ADA",                  # Adaptation: (g, t, n)
+    "K_ADA",                  # Adaptation: (g, t, n)
+    "SAI",                    # SAI g6: (t, n, inj)
+    "E_STOR",                 # CCS storage: (ccs_stor, t, n)
+]
+# Explicit region-column index for each extra 3D variable.
+# Avoids fragile heuristic detection that can mis-identify SAI's inj column.
+_3D_EXTRA_REGION_COL = {
+    "I_ADA": 2,   # (g, t, n)
+    "K_ADA": 2,   # (g, t, n)
+    "SAI": 1,     # (t, n, inj)
+    "E_STOR": 2,  # (ccs_stor, t, n)
+}
 
 
 def _safe_bound(val, default):
@@ -1205,6 +1523,29 @@ def _fix_other_regions(v, other_regions, cfg):
                     _safe_bound(up_raw, float("inf")))
                 var.fx[t_str, n_str] = level
 
+    # Extra 3D vars with explicit region-column mapping
+    for vname in _NASH_FIX_VARS_3D_EXTRA:
+        var = v.get(vname)
+        if var is None or var.records is None:
+            continue
+        if not hasattr(var, "_saved_bounds"):
+            var._saved_bounds = {}
+        ncols = var.records.shape[1]
+        n_domain_cols = ncols - 4  # subtract level/marginal/lower/upper
+        col_idx = _3D_EXTRA_REGION_COL.get(vname, 2)
+        for _, row in var.records.iterrows():
+            n_str = str(row.iloc[col_idx])
+            if n_str in other_set:
+                level = row["level"]
+                key = tuple(str(row.iloc[i]) for i in range(n_domain_cols))
+                if key not in var._saved_bounds:
+                    lo_raw = row.get("lower", None)
+                    up_raw = row.get("upper", None)
+                    var._saved_bounds[key] = (
+                        _safe_bound(lo_raw, -float("inf")),
+                        _safe_bound(up_raw, float("inf")))
+                var.fx[key] = level
+
 
 def _unfix_other_regions(v, other_regions, cfg):
     """Restore decision variable bounds for non-active regions."""
@@ -1230,6 +1571,17 @@ def _unfix_other_regions(v, other_regions, cfg):
             var.up[t_str, n_str] = up
         var._saved_bounds = {}
 
+    # Restore extra 3D variables (adaptation, SAI g6, E_STOR)
+    for vname in _NASH_FIX_VARS_3D_EXTRA:
+        var = v.get(vname)
+        if var is None:
+            continue
+        saved = getattr(var, "_saved_bounds", {})
+        for key, (lo, up) in saved.items():
+            var.lo[key] = lo
+            var.up[key] = up
+        var._saved_bounds = {}
+
 
 # ---------------------------------------------------------------------------
 #  Internal: module ordering and parameter creation
@@ -1238,31 +1590,53 @@ def _unfix_other_regions(v, other_regions, cfg):
 def _module_order(cfg):
     """Return modules in dependency order."""
     # Impact submodule selection
-    if cfg.impact == "dice":
-        impact_mod = mod_impact_dice
-    elif cfg.impact == "burke":
-        impact_mod = mod_impact_burke
-    else:
-        impact_mod = mod_impact_kalkuhl
+    impact_map = {
+        "dice": mod_impact_dice,
+        "kalkuhl": mod_impact_kalkuhl,
+        "burke": mod_impact_burke,
+        "howard": mod_impact_howard,
+        "dell": mod_impact_dell,
+        "coacch": mod_impact_coacch,
+        "climcost": mod_impact_coacch,  # same module, different damcost key
+    }
+    impact_mod = impact_map.get(cfg.impact, mod_impact_kalkuhl)
 
     # Climate submodule selection
     if cfg.climate == "fair":
         climate_mod = mod_climate_fair
+    elif cfg.climate == "tatm_exogen":
+        # Exogenous temperature: skip endogenous climate entirely.
+        # mod_climate_tatm_exogen creates TATM/FORC/TOCEAN stubs and fixes TATM.
+        climate_mod = mod_climate_tatm_exogen
     else:
         climate_mod = hub_climate  # witchco2 (default)
+
+    # When impact_deciles is active, DAMAGES comes from mod_impact_deciles
+    # instead of hub_impact. We still need hub_impact for OMEGA/DAMFRAC vars
+    # but tell it to skip the damages equation.
+    use_decile_damages = (getattr(cfg, "impact_deciles", False)
+                          and getattr(cfg, "inequality", False))
+    if use_decile_damages:
+        cfg._decile_damages = True  # signal to hub_impact
 
     # Order follows modules/__init__.py docstring (respects variable dependencies)
     mods = [
         mod_landuse,           # ELAND, MIULAND, MACLAND, ABCOSTLAND
         hub_impact,            # OMEGA, DAMFRAC*, DAMAGES (needs YGROSS stub)
         climate_mod,           # W_EMI, FORC, TATM, etc.
-        mod_climate_regional,  # TEMP_REGION, TEMP_REGION_DAM (needs TATM)
-        impact_mod,            # BIMPACT + eq_omega (needs TATM/TEMP_REGION_DAM)
     ]
+    mods.append(mod_climate_regional)  # TEMP_REGION, TEMP_REGION_DAM
+    # In decile mode, skip the normal impact module entirely to avoid
+    # duplicate BIMPACT/eq_bimpact symbols. mod_impact_deciles replaces it.
+    if not use_decile_damages:
+        mods.append(impact_mod)       # BIMPACT + eq_omega
 
     # Optional: DAC (needs to come before core_emissions for E_NEG variable)
     if getattr(cfg, "dac", False):
         mods.append(mod_dac)
+        # CCS storage module (per-type storage, cumulative tracking, leakage)
+        # Must come after mod_dac (needs E_NEG) and before core_emissions
+        mods.append(mod_emi_stor)
 
     # Optional: SAI (needs TATM from climate module)
     if getattr(cfg, "sai", False):
@@ -1282,6 +1656,9 @@ def _module_order(cfg):
     # Optional: Inequality (needs YGROSS, DAMAGES, ABATECOST, CPC)
     if getattr(cfg, "inequality", False):
         mods.append(mod_inequality)
+        # Optional: Per-decile damages (needs YGROSS_DIST from inequality)
+        if getattr(cfg, "impact_deciles", False):
+            mods.append(mod_impact_deciles)
 
     mods.append(core_welfare)  # UTARG, UTILITY (needs CPC)
 
@@ -1369,6 +1746,15 @@ def _create_parameters(m, sets, data, cfg):
         p["par_emi_bau"] = Parameter(m, name="emi_bau", domain=[t_set, n_set, ghg_set],
                                       records=tng_records(legacy_emi))
 
+    # par_emi_level: mirrors GAMS E.l in eq_yy fiscal revenue term.
+    # Initialized to BAU emissions; updated to E.l each iteration in _before_solve.
+    if emi_bau_data is not None:
+        p["par_emi_level"] = Parameter(m, name="emi_level", domain=[t_set, n_set, ghg_set],
+                                        records=tng_records(emi_bau_data))
+    else:
+        p["par_emi_level"] = Parameter(m, name="emi_level", domain=[t_set, n_set, ghg_set],
+                                        records=tng_records(legacy_emi))
+
     p["par_eland_bau"] = Parameter(m, name="eland_bau", domain=[t_set, n_set],
                                     records=tn_records(data["eland_bau"]))
     p["par_eland_maxab"] = Parameter(m, name="eland_maxab", domain=[n_set],
@@ -1429,6 +1815,10 @@ def _create_parameters(m, sets, data, cfg):
                                     records=[(r, data["beta_temp_dict"].get(r, 1.0)) for r in rn])
     p["par_base_temp"] = Parameter(m, name="base_temp", domain=[n_set],
                                     records=[(r, data["base_temp_dict"].get(r, 0.0)) for r in rn])
+    p["par_alpha_precip"] = Parameter(m, name="alpha_precip", domain=[n_set],
+                                       records=[(r, data.get("alpha_precip_dict", {}).get(r, 0.0)) for r in rn])
+    p["par_beta_precip"] = Parameter(m, name="beta_precip", domain=[n_set],
+                                      records=[(r, data.get("beta_precip_dict", {}).get(r, 0.0)) for r in rn])
 
     # Climate scalars
     cmphi = data["cmphi"]
@@ -1503,6 +1893,31 @@ def _create_parameters(m, sets, data, cfg):
             m, name="pledge_nz_year_co2", domain=[n_set],
             records=[(r, pledge_data[r]) for r in rn if r in pledge_data])
 
+    # GHG pledge years (GAMS default: 2310 = effectively disabled)
+    pledge_ghg_data = data.get("pledge_nz_year_ghg")
+    if pledge_ghg_data:
+        p["par_pledge_nz_year_ghg"] = Parameter(
+            m, name="pledge_nz_year_ghg", domain=[n_set],
+            records=[(r, pledge_ghg_data[r]) for r in rn if r in pledge_ghg_data])
+
+    # Country-level BAU emissions for NDC weighting (raw Python dict, not GAMSPy Parameter)
+    emi_bau_country = data.get("emi_bau_country")
+    if emi_bau_country is not None:
+        p["_emi_bau_country"] = emi_bau_country
+
+    # Carbon debt for historical_responsibility burden sharing (raw dict)
+    carbon_debt = data.get("carbon_debt_by_region")
+    if carbon_debt is not None:
+        p["_carbon_debt_by_region"] = carbon_debt
+
+    # Country-level ykali/pop for Burke rich/poor classification (raw dicts)
+    ykali_cty = data.get("ykali_country")
+    if ykali_cty is not None:
+        p["_ykali_country"] = ykali_cty
+    pop_cty = data.get("pop_country")
+    if pop_cty is not None:
+        p["_pop_country"] = pop_cty
+
     # Initial savings rate s0 (for flexible savings mode)
     # GAMS core_economy.gms: s0('savings_rate', '1', n)
     p["par_s0"] = Parameter(m, name="s0", domain=[n_set],
@@ -1523,6 +1938,12 @@ def _create_parameters(m, sets, data, cfg):
             us_gdppc_1 = us_yk / us_pop * 1e6  # T$/million -> $/person
             p["par_us_gdppc_1"] = Parameter(
                 m, name="us_gdppc_1", records=us_gdppc_1)
+
+    # par_ynet_level: mirrors GAMS YNET.l for ocean VSL/mangrove.
+    # Initialized to ykali; updated to YNET.l in _before_solve.
+    p["par_ynet_level"] = Parameter(
+        m, name="ynet_level", domain=[t_set, n_set],
+        records=tn_records(data["ykali_dict"]))
 
     # D7: DAC total cost parameter (for iterative learning-curve updates)
     # Created unconditionally so _update_dac_learning can write back to it.
@@ -1570,11 +1991,20 @@ def _create_parameters(m, sets, data, cfg):
         p["par_gcap_scale"] = Parameter(m, name="gcap_scale",
                                          domain=[n_set], records=gcap_recs)
 
-    # ada_exp scalar for hub_impact (Issue 10): use average of ces_ada 'exp'
+    # ada_exp scalar for hub_impact (legacy fallback)
     if ces_ada:
         exp_vals = [v for (k, r), v in ces_ada.items() if k == "exp"]
         if exp_vals:
             p["ada_exp_scalar"] = sum(exp_vals) / len(exp_vals)
+
+    # OMEGA positive indicator for adaptation gate (GAMS: $(OMEGA.l(t,n) gt 0))
+    # Initialized to 1 for all (t, n) = assume damages. Updated in _before_solve.
+    if cfg.adaptation:
+        omega_pos_records = [(str(t), r, 1.0)
+                             for t in range(1, T + 1) for r in rn]
+        p["par_omega_positive"] = Parameter(
+            m, name="omega_positive", domain=[t_set, n_set],
+            records=omega_pos_records)
 
     # Region weights for welfare function (Negishi or population-based)
     # GAMS core_cooperation.gms line 18: Negishi weights use the POSITIVE

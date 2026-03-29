@@ -151,6 +151,32 @@ def declare_vars(m, sets, params, cfg, v):
         if yr < sai_start or yr > sai_end:
             N_SAI.fx[str(tp), n_set] = 0
 
+    # GAMS can_deploy gate: restrict which regions can inject
+    # GAMS mod_sai.gms lines 9, 31-46: can_inject(n) gates N_SAI.fx
+    can_deploy = getattr(cfg, "can_deploy", "no")
+    region_names = [str(r) for r in n_set.records.iloc[:, 0]]
+    if can_deploy == "no":
+        # No region can deploy SAI
+        N_SAI.fx[t_set, n_set] = 0
+    elif can_deploy == "all":
+        pass  # all regions can deploy (no restriction)
+    elif can_deploy == "coal":
+        # Coalition-based deployment: only regions in the SAI coalition can inject
+        # GAMS: can_inject(n) = yes$(coalitions("%sai_coalition%",n))
+        coalition_def = getattr(cfg, "coalition_def", None)
+        sai_coalition = getattr(cfg, "sai_coalition", "sai")
+        coal_members = set()
+        if coalition_def is not None and isinstance(coalition_def, dict):
+            coal_members = set(coalition_def.get(sai_coalition, []))
+        for rn in region_names:
+            if rn not in coal_members:
+                N_SAI.fx[t_set, rn] = 0
+    else:
+        # Specific region name: only that region can deploy
+        for rn in region_names:
+            if rn.lower() != can_deploy.lower():
+                N_SAI.fx[t_set, rn] = 0
+
     v["W_SAI"] = W_SAI
     v["N_SAI"] = N_SAI
     v["COST_SAI"] = COST_SAI

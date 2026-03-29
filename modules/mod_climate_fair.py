@@ -436,6 +436,42 @@ def define_eqs(m, sets, params, cfg, v):
     par_forcing_exogenous = Parameter(m, name="forcing_exogenous",
                                       domain=[t_set], records=forc_exog_recs)
 
+    # Load exogenous emissions for o3trop (NOx, CO, NMVOC)
+    # GAMS eq_forco3trop uses Emissions(t,rcp,'n_ox'), ('co'), ('nmvoc')
+    emi_nox_recs = []
+    emi_co_recs = []
+    emi_nmvoc_recs = []
+    emi_file = os.path.join(climate_data_dir, "Emissions.csv")
+    if os.path.exists(emi_file):
+        try:
+            emi_df = pd.read_csv(emi_file)
+            rcp_name_emi = getattr(cfg, "rcp", "RCP45")
+            for _, row in emi_df.iterrows():
+                rcp = str(row.iloc[1])
+                if rcp != rcp_name_emi:
+                    continue
+                t_str = str(row.iloc[0])
+                agent = str(row.iloc[2]).lower()
+                val = float(row["Val"])
+                if agent == "n_ox":
+                    emi_nox_recs.append((t_str, val))
+                elif agent == "co":
+                    emi_co_recs.append((t_str, val))
+                elif agent == "nmvoc":
+                    emi_nmvoc_recs.append((t_str, val))
+        except Exception:
+            pass
+    # Fallback: baseline values (GAMS reference points: NOx=2, CO=170, NMVOC=5 Mt)
+    if not emi_nox_recs:
+        emi_nox_recs = [(str(t), 2.0) for t in range(1, T + 1)]
+    if not emi_co_recs:
+        emi_co_recs = [(str(t), 170.0) for t in range(1, T + 1)]
+    if not emi_nmvoc_recs:
+        emi_nmvoc_recs = [(str(t), 5.0) for t in range(1, T + 1)]
+    par_emi_nox = Parameter(m, name="emi_nox", domain=[t_set], records=emi_nox_recs)
+    par_emi_co = Parameter(m, name="emi_co", domain=[t_set], records=emi_co_recs)
+    par_emi_nmvoc = Parameter(m, name="emi_nmvoc", domain=[t_set], records=emi_nmvoc_recs)
+
     # Variables
     TATM = v["TATM"]
     FORC = v["FORC"]
@@ -568,14 +604,19 @@ def define_eqs(m, sets, params, cfg, v):
     equations.append(eq_methoxi)
 
     # ------------------------------------------------------------------
-    # 9. eq_ffch4: Fossil methane fraction
+    # 9. eq_ffch4: Fossil methane fraction (endogenous)
     # GAMS: FF_CH4(t) = fossilch4_frac(t,rcp)
-    #        * (sum(n, EIND(t,n,'co2'))) / (sum(n, convq*sigma*ykali))
-    # Simplified: fix to exogenous fossil fraction (the ratio is ~1 in BAU)
+    #        * sum(n, EIND(t,n,'co2')) / sum(n, convq*sigma*ykali)
+    # The ratio tracks how actual CO2 emissions deviate from baseline.
+    # Under mitigation, the ratio < 1, reducing fossil CH4 fraction.
     # ------------------------------------------------------------------
+    EIND = v["EIND"]
+    par_emi_bau = params["par_emi_bau"]
     eq_ffch4 = Equation(m, name="eq_ffch4", domain=[t_set])
     eq_ffch4[t_set] = (
         FF_CH4[t_set] == par_fossilch4_frac[t_set]
+        * Sum(n_set, EIND[t_set, n_set, "co2"])
+        / Sum(n_set, par_emi_bau[t_set, n_set, "co2"])
     )
     equations.append(eq_ffch4)
 
@@ -651,12 +692,13 @@ def define_eqs(m, sets, params, cfg, v):
     # Simplified: use only CH4-driven component + temperature feedback
     # ------------------------------------------------------------------
     eq_forco3trop = Equation(m, name="eq_forco3trop", domain=[t_set])
-    # The emissions-based terms (NOx, CO, NMVOC) are exogenous and small;
-    # approximate as zero deviation from baseline.
-    # Temperature feedback: 0.032*(exp(-1.35*(TATM+dt0)) - 1) smoothed
+    # GAMS eq_forco3trop: CH4 + NOx/CO/NMVOC emissions + temperature feedback
     eq_forco3trop[t_set] = (
         ORF_O3TROP[t_set] ==
         1.74e-4 * (CONC["ch4", t_set] - cp_ch4)
+        + 9.08e-4 * (par_emi_nox[t_set] - 2)
+        + 8.51e-5 * (par_emi_co[t_set] - 170)
+        + 2.25e-4 * (par_emi_nmvoc[t_set] - 5)
         + (0.032 * (exp(-1.35 * (TATM[t_set] + dt0)) - 1)
            - sqrt(sqr(0.032 * (exp(-1.35 * (TATM[t_set] + dt0)) - 1))
                   + sqr(Number(1e-8)))) / 2

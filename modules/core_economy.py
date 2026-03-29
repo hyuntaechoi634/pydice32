@@ -144,11 +144,27 @@ def define_eqs(m, sets, params, cfg, v):
     # Equations
     # ------------------------------------------------------------------
     # eq_ygross: YGROSS = tfp * K^cap * (pop/1000)^lab, only t>1
+    # GAMS core_economy.gms lines 330-332: when mod_natural_capital is set,
+    # includes GLOBAL_NN^elasticity * NAT_CAP_DAM('market')^prodshare('nature')
     eq_ygross = Equation(m, name="eq_ygross", domain=[t_set, n_set])
-    eq_ygross[t_set, n_set].where[Ord(t_set) > 1] = (
-        YGROSS[t_set, n_set] == par_tfp[t_set, n_set]
+    ygross_rhs = (
+        par_tfp[t_set, n_set]
         * (K[t_set, n_set] ** par_prodshare_cap[n_set])
         * ((par_pop[t_set, n_set] / 1000) ** par_prodshare_lab[n_set])
+    )
+    if cfg.natural_capital and "GLOBAL_NN" in v and "NAT_CAP_DAM" in v:
+        GLOBAL_NN = v["GLOBAL_NN"]
+        NAT_CAP_DAM = v["NAT_CAP_DAM"]
+        par_natcap_elasticity = params.get("par_natcap_global_elasticity")
+        par_prodshare_nature = params.get("par_prodshare_nature")
+        if par_natcap_elasticity is not None and par_prodshare_nature is not None:
+            ygross_rhs = (
+                ygross_rhs
+                * (GLOBAL_NN[t_set, n_set] ** par_natcap_elasticity[n_set])
+                * (NAT_CAP_DAM["market", t_set, n_set] ** par_prodshare_nature[n_set])
+            )
+    eq_ygross[t_set, n_set].where[Ord(t_set) > 1] = (
+        YGROSS[t_set, n_set] == ygross_rhs
     )
 
     # eq_ynet: YNET = YGROSS - DAMAGES
@@ -183,22 +199,23 @@ def define_eqs(m, sets, params, cfg, v):
         yy_rhs = yy_rhs - v["COST_CDR"][t_set, n_set]
     if "COST_SAI" in v:
         yy_rhs = yy_rhs - v["COST_SAI"][t_set, n_set]
-    # Item 6: Carbon tax fiscal revenue term
-    # GAMS: - sum(ghg, ctax_corrected(t,n,ghg) * convy_ghg(ghg) * (E(t,n,ghg) - E.l(t,n,ghg)))
-    # When ctax policy is active (and not ctax_marginal), add fiscal revenue.
-    # Uses par_emi_bau as proxy for E.l (BAU emission level).
+    # Carbon tax fiscal revenue term
+    # GAMS eq_yy: - sum(ghg, ctax_corrected(t,n,ghg) * convy_ghg(ghg) * (E(t,n,ghg) - E.l(t,n,ghg)))
+    # E.l = emission level from previous iteration. In single-pass, use par_emi_bau as proxy.
+    # In iterative mode, par_emi_level is updated to E.l by _before_solve.
     if (cfg.policy in ("ctax", "cbudget_regional")
             and "par_ctax_corrected" in v
             and not cfg.ctax_marginal):
         par_ctax_corr = v["par_ctax_corrected"]
         par_convy_ghg = params["par_convy_ghg"]
-        par_emi_bau = params["par_emi_bau"]
+        # par_emi_level: initialized to par_emi_bau, updated to E.l in iterative mode
+        par_emi_level = params.get("par_emi_level", params["par_emi_bau"])
         E = v["E"]
         yy_rhs = yy_rhs - Sum(
             ghg_set,
             par_ctax_corr[t_set, ghg_set]
             * par_convy_ghg[ghg_set]
-            * (E[t_set, n_set, ghg_set] - par_emi_bau[t_set, n_set, ghg_set])
+            * (E[t_set, n_set, ghg_set] - par_emi_level[t_set, n_set, ghg_set])
         )
     eq_yy[t_set, n_set] = Y[t_set, n_set] == yy_rhs
 

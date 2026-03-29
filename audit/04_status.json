@@ -1,0 +1,76 @@
+{
+  "generated_at": "2026-03-29",
+  "audit_mode": "deep_static_independent_reaudit_after_followup_fixes",
+  "source_model": "RICE50xmodel",
+  "target_model": "pydice32",
+  "runs_performed": false,
+  "excluded_modules": [
+    "mod_climate_witchghg",
+    "mod_impact_sai"
+  ],
+  "summary": {
+    "high_findings": 1,
+    "medium_findings": 2,
+    "low_findings": 0,
+    "resolved_since_prior_audit": [
+      "DAC build-order cost wiring",
+      "DAC raw OG/EOR double-counting",
+      "E_STOR inclusion in Nash fix/unfix lists",
+      "impact_deciles normal-impact symbol conflict",
+      "impact_deciles DAMAGES_DIST wiring in inequality",
+      "ccs_stor_cap_max config surface",
+      "coalition-def CLI support",
+      "README/module-status refresh"
+    ],
+    "main_risk_areas": [
+      "impact_deciles_equation_fidelity",
+      "nash_sai_region_column_detection",
+      "explicit_storage_capacity_override"
+    ]
+  },
+  "coverage": {
+    "translated_or_merged_core": [
+      "core_time",
+      "core_regions",
+      "core_algorithm",
+      "core_economy",
+      "core_emissions",
+      "core_welfare",
+      "core_abatement",
+      "pol_ndc",
+      "mod_stochastic"
+    ],
+    "partial_modules": [
+      "core_cooperation",
+      "mod_impact_deciles",
+      "mod_sai",
+      "core_policy",
+      "mod_natural_capital"
+    ],
+    "missing_modules": [
+      "mod_emission_pulse",
+      "mod_climate_witchghg",
+      "mod_impact_sai"
+    ]
+  },
+  "findings": [
+    {
+      "id": "A01",
+      "severity": "high",
+      "title": "impact_deciles still differs from source in BIMPACT activation and the quadratic temperature-reference term",
+      "status": "open"
+    },
+    {
+      "id": "A02",
+      "severity": "medium",
+      "title": "Nash fixing for extra 3D controls is still fragile for SAI(t,n,inj)",
+      "status": "open"
+    },
+    {
+      "id": "A03",
+      "severity": "medium",
+      "title": "Explicit ccs_stor_cap_max override is surfaced in config but not yet honored by the storage loader",
+      "status": "open"
+    }
+  ]
+}

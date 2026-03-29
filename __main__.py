@@ -89,6 +89,14 @@ def main():
             cfg.cooperation = "noncoop"
         elif arg == "--coalitions":
             cfg.cooperation = "coalitions"
+        elif arg.startswith("--coalition-def="):
+            import json as _json
+            val = arg.split("=", 1)[1]
+            if os.path.isfile(val):
+                with open(val) as _f:
+                    cfg.coalition_def = _json.load(_f)
+            else:
+                cfg.coalition_def = _json.loads(val)
         elif arg.startswith("--max-iter="):
             cfg.max_iter = int(arg.split("=")[1])
         elif arg.startswith("--min-iter="):

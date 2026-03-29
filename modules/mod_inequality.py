@@ -174,6 +174,8 @@ def define_eqs(m, sets, params, cfg, v):
                 qref_recs.append((str(t), r, d, val))
     par_qref = Parameter(m, name="quantiles_ref",
                          domain=[t_set, n_set, dist_set], records=qref_recs)
+    # Register in params so fiscal-term branch in eq_ydist_unbnd can find it
+    params["par_quantiles_ref"] = par_qref
 
     # Compute inequality weights
     # ineq_weights(t,n,dist,elast) = qref^el / sum(dd, qref^el)
@@ -221,11 +223,21 @@ def define_eqs(m, sets, params, cfg, v):
     # ------------------------------------------------------------------
     eq_ynetdist = Equation(m, name="eq_ynetdist_unbnd",
                            domain=[t_set, n_set, dist_set])
-    eq_ynetdist[t_set, n_set, dist_set] = (
-        YNET_DIST[t_set, n_set, dist_set] ==
-        YGROSS_DIST[t_set, n_set, dist_set]
-        - DAMAGES[t_set, n_set] * par_ineq_w_dam[t_set, n_set, dist_set]
-    )
+    # GAMS: when mod_impact_deciles is active, use DAMAGES_DIST directly
+    # instead of distributing aggregate DAMAGES via inequality weights.
+    if getattr(cfg, "impact_deciles", False) and "DAMAGES_DIST" in v:
+        DAMAGES_DIST = v["DAMAGES_DIST"]
+        eq_ynetdist[t_set, n_set, dist_set] = (
+            YNET_DIST[t_set, n_set, dist_set] ==
+            YGROSS_DIST[t_set, n_set, dist_set]
+            - DAMAGES_DIST[t_set, n_set, dist_set]
+        )
+    else:
+        eq_ynetdist[t_set, n_set, dist_set] = (
+            YNET_DIST[t_set, n_set, dist_set] ==
+            YGROSS_DIST[t_set, n_set, dist_set]
+            - DAMAGES[t_set, n_set] * par_ineq_w_dam[t_set, n_set, dist_set]
+        )
     equations.append(eq_ynetdist)
 
     # ------------------------------------------------------------------
@@ -244,6 +256,26 @@ def define_eqs(m, sets, params, cfg, v):
     # ------------------------------------------------------------------
     # eq_ydist_unbnd: Y_DIST_PRE = YNET_DIST - (ABATECOST + CTX) * ineq_weights('abatement')
     # ------------------------------------------------------------------
+    # GAMS mod_inequality.gms line 231: fiscal revenue term
+    # $if not set ctax_marginal
+    #   - sum(ghg, ctax_corrected * convy_ghg * (E - E.l) * quantiles_ref)
+    fiscal_term = 0
+    if (cfg.policy in ("ctax", "cbudget_regional")
+            and not cfg.ctax_marginal
+            and "par_ctax_corrected" in v):
+        par_ctax_corr = v["par_ctax_corrected"]
+        par_convy_ghg = params["par_convy_ghg"]
+        E = v["E"]
+        par_emi_level = params.get("par_emi_level", params["par_emi_bau"])
+        par_quant_ref = params.get("par_quantiles_ref")
+        if par_quant_ref is not None:
+            fiscal_term = Sum(
+                ghg_set,
+                par_ctax_corr[t_set, ghg_set]
+                * par_convy_ghg[ghg_set]
+                * (E[t_set, n_set, ghg_set] - par_emi_level[t_set, n_set, ghg_set])
+            ) * par_quant_ref[t_set, n_set, dist_set]
+
     eq_ydist_unbnd = Equation(m, name="eq_ydist_unbnd",
                               domain=[t_set, n_set, dist_set])
     eq_ydist_unbnd[t_set, n_set, dist_set] = (
@@ -251,6 +283,7 @@ def define_eqs(m, sets, params, cfg, v):
         YNET_DIST[t_set, n_set, dist_set]
         - (Sum(ghg_set, ABATECOST[t_set, n_set, ghg_set]) + CTX[t_set, n_set])
         * par_ineq_w_abate[t_set, n_set, dist_set]
+        - fiscal_term
     )
     equations.append(eq_ydist_unbnd)
 

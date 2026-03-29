@@ -205,9 +205,31 @@ def define_eqs(m, sets, params, cfg, v):
         omega_expr = OMEGA[t_set, n_set] + OMEGA_SLR[t_set, n_set]
         if "Q_ADA" in v:
             Q_ADA = v["Q_ADA"]
-            # The adaptation CES exponent; load from params or use default 2
-            ada_exp = params.get("ada_exp_scalar", 2)
-            base_expr = 1 - 1 / (1 + omega_expr / (1 + Q_ADA["ada", t_set, n_set] ** ada_exp))
+            # GAMS hub_impact.gms line 97:
+            #   OMEGA / (1 + Q_ADA('ada',t,n)**ces_ada('exp',n))$(OMEGA.l(t,n) gt 0)
+            # ces_ada('exp',n) is per-region; use par_ces_ada_exp Parameter.
+            par_ces_ada_exp = params.get("par_ces_ada_exp")
+            if par_ces_ada_exp is not None:
+                ada_exp_expr = par_ces_ada_exp[n_set]
+            else:
+                ada_exp_expr = 2  # fallback scalar
+
+            # GAMS $(OMEGA.l(t,n) gt 0) gate: adaptation divisor only applies
+            # when OMEGA is positive (net damages). When OMEGA <= 0 (warming
+            # benefits), no adaptation is needed.
+            #
+            # par_omega_positive is an indicator parameter [t, n] that is 1
+            # when OMEGA.l > 0, else 0. Initialized to 1 (conservative: assume
+            # damages), updated in _before_solve for iterative solver.
+            #
+            # Formula: divisor = 1 + Q_ADA^exp * omega_gate
+            # When omega_gate=1: full adaptation.  When omega_gate=0: divisor=1.
+            par_omega_gate = params.get("par_omega_positive")
+            if par_omega_gate is not None:
+                ada_divisor = 1 + Q_ADA["ada", t_set, n_set] ** ada_exp_expr * par_omega_gate[t_set, n_set]
+            else:
+                ada_divisor = 1 + Q_ADA["ada", t_set, n_set] ** ada_exp_expr
+            base_expr = 1 - 1 / (1 + omega_expr / ada_divisor)
         else:
             base_expr = 1 - 1 / (1 + omega_expr)
 
@@ -279,15 +301,17 @@ def define_eqs(m, sets, params, cfg, v):
         )
 
     # eq_damages: DAMAGES = YGROSS * DAMFRAC
-    eq_damages = Equation(m, name="eq_damages", domain=[t_set, n_set])
-    if policy_with_damages:
-        eq_damages[t_set, n_set] = (
-            DAMAGES[t_set, n_set] == YGROSS[t_set, n_set] * DAMFRAC[t_set, n_set]
-        )
-    else:
-        eq_damages[t_set, n_set] = DAMAGES[t_set, n_set] == 0
-
-    equations.append(eq_damages)
+    # When impact_deciles is active, DAMAGES = sum(dist, DAMAGES_DIST) is defined
+    # in mod_impact_deciles instead. Skip the aggregate equation here.
+    if not getattr(cfg, "_decile_damages", False):
+        eq_damages = Equation(m, name="eq_damages", domain=[t_set, n_set])
+        if policy_with_damages:
+            eq_damages[t_set, n_set] = (
+                DAMAGES[t_set, n_set] == YGROSS[t_set, n_set] * DAMFRAC[t_set, n_set]
+            )
+        else:
+            eq_damages[t_set, n_set] = DAMAGES[t_set, n_set] == 0
+        equations.append(eq_damages)
 
     # Add SLR damage equations
     equations.extend(slr_equations)

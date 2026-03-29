@@ -54,8 +54,8 @@ class Config:
     ctax_start: int = 2025          # year tax begins
     ctax_slope: float = 0.05        # annual growth rate
     ctax_shape: str = "exponential" # exponential (only option for now)
-    ctax_marginal: bool = True      # True = MAC-fixing (CO2-only, simpler than GAMS fiscal approach).
-                                    # GAMS uses fiscal revenue (iterative), but single-pass needs MAC-fix.
+    ctax_marginal: bool = False     # GAMS default: fiscal revenue approach (ctax_corrected in eq_yy).
+                                    # True = MAC-fixing (CO2-only), disabled in GAMS v2.5.0.
 
     # Net-zero (global_netzero policy)
     nz_year: int = 2050             # year global net-zero CO2 is enforced
@@ -72,6 +72,8 @@ class Config:
 
     # Impact
     impact: str = ""                # "" (sentinel: use policy default) | dice | kalkuhl | burke
+                                    # | howard | dell | coacch | climcost
+    damcost: str = ""               # COACCH/CLIMCOST damage set (auto-set from impact)
     bhm_spec: str = "sr"            # Burke spec: sr | lr | srdiff | lrdiff
     omega_eq: str = "simple"        # simple | full (omega formulation for Kalkuhl/Burke)
 
@@ -87,7 +89,7 @@ class Config:
     damages_postprocessed: bool = False  # True = decouple DAMAGES from optimization
 
     # Climate
-    climate: str = "witchco2"       # witchco2 | fair
+    climate: str = "witchco2"       # witchco2 | fair | tatm_exogen
 
     # Climate: regional temperature cap (Burke conservative approach)
     temp_region_cap: bool = False
@@ -96,7 +98,7 @@ class Config:
     # Abatement / MIU
     miu_inertia: float = 0.034      # per year (default RICE)
     max_miuup: float = 1.0          # MIU upper bound for CO2
-    tmiufix: tuple = (1, 2, 3)      # periods where MIU is fixed (2015, 2020, 2025)
+    tmiufix: tuple = (1, 2)          # periods where MIU is fixed (GAMS default: {1,2})
 
     # GHG species
     ghg_list: tuple = ("co2", "ch4", "n2o")
@@ -113,14 +115,16 @@ class Config:
     dac: bool = False               # activate DAC module
     dac_cost: str = "best"          # DAC cost scenario: low | best | high
     dac_growth: str = "medium"      # DAC market growth: low | medium | high
+    ccs_stor_cap_max: str = ""      # "" = derive from SSP; explicit: low | best | high
 
     # SAI (Stratospheric Aerosol Injection)
     sai: bool = False               # activate SAI module
-    sai_start: int = 2050           # year SAI deployment begins
+    sai_start: int = 2035           # year SAI deployment begins (GAMS default: 2035)
     sai_end: int = 2200             # year SAI deployment ends
-    sai_experiment: str = "g0"      # g0 (uniform solar constant) | g6 (emulator)
+    sai_experiment: str = "g6"      # g0 (uniform solar constant) | g6 (emulator, GAMS default)
     sai_mode: str = "free"          # free | max_efficiency | equator | tropics | symmetric
     sai_damage_coef: float = 0.03   # damage coef for g0: GDP loss fraction for 12 TgS/yr
+    can_deploy: str = "no"          # GAMS default: "no" | "all" | region name
 
     # Adaptation
     adaptation: bool = False        # activate adaptation module
@@ -133,6 +137,7 @@ class Config:
 
     # Inequality (within-country income distribution)
     inequality: bool = False        # activate inequality module
+    impact_deciles: bool = False    # activate per-decile damages (requires inequality=True)
 
     # Labour (labour market extensions)
     labour: bool = False            # activate labour module
@@ -146,6 +151,16 @@ class Config:
     max_iter: int = 100             # max iterations for iterative solve
     min_iter: int = 4               # min iterations before convergence check
     convergence_tol: float = 1e-2   # max relative variation for convergence
+
+    # Coalition definitions (for cooperation="coalitions")
+    # NOTE: GAMS preset coal_*.gms files are not ported. Coalitions mode
+    # requires explicit coalition_def via Python API or --coalition-def CLI flag.
+    # Without coalition_def, falls back to noncoop (one region per coalition).
+    # Dict mapping coalition name -> list of region names, e.g.:
+    #   {"EU": ["EU-12", "EU-15", "EFTA"], "China_India": ["China", "India"], ...}
+    # Regions not in any coalition are each their own singleton coalition.
+    # Can also be a path to a JSON file.
+    coalition_def: object = None
 
     # Paths (set by resolve_paths)
     project_root: str = ""
@@ -187,8 +202,21 @@ class Config:
 
         # GAMS mod_impact_burke.gms line 28: "$setglobal damage_cap"
         # Burke's extreme impact functions require damage cap by default.
-        if self.impact == "burke":
+        if self.impact in ("burke", "dell"):
             self.damage_cap = True
+
+        # SSP-based storage capacity scenario (GAMS mod_emi_stor.gms lines 26-30)
+        if self.ccs_stor_cap_max == "":
+            ssp_cap = {"SSP1": "low", "SSP2": "best", "SSP3": "high",
+                       "SSP4": "high", "SSP5": "high"}
+            self.ccs_stor_cap_max = ssp_cap.get(self.SSP.upper(), "best")
+
+        # Auto-set damcost for COACCH/CLIMCOST
+        if self.damcost == "":
+            if self.impact == "coacch":
+                self.damcost = "COACCH_NoSLR"
+            elif self.impact == "climcost":
+                self.damcost = "climcost"
 
         # Issue 1: cea_tatm and cea_rcp auto-set damages_postprocessed
         if self.policy in ("cea_tatm", "cea_rcp"):

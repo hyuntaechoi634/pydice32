@@ -300,10 +300,14 @@ def define_eqs(m, sets, params, cfg, v):
         us_denom = (Sum(n_alias, par_ykali["1", n_alias])
                     / Sum(n_alias, par_pop["1", n_alias]))
 
+    # GAMS mod_ocean.gms line 180: VSL uses YNET.l (solved GDP, not baseline)
+    # par_ynet_level is initialized to par_ykali, updated to YNET.l in
+    # _before_solve for iterative solver.
+    par_ynet_level = params.get("par_ynet_level", par_ykali)
     eq_ocean_vsl = Equation(m, name="eq_ocean_vsl", domain=[t_set, n_set])
     eq_ocean_vsl[t_set, n_set] = (
         VSL[t_set, n_set] == VSL_START
-        * (Sum(n_alias, par_ykali[t_set, n_alias])
+        * (Sum(n_alias, par_ynet_level[t_set, n_alias])
            / Sum(n_alias, par_pop[t_set, n_alias]))
         / us_denom
     )
@@ -396,7 +400,7 @@ def define_eqs(m, sets, params, cfg, v):
     ] = (
         OCEAN_USENM_VALUE["mangrove", t_set, n_set] ==
         gams_exp(par_value_intercept_unm["mangrove", n_set])
-        * (YNET[t_set, n_set] / par_pop[t_set, n_set] * 1e6)
+        * (par_ynet_level[t_set, n_set] / par_pop[t_set, n_set] * 1e6)
           ** par_value_exp_unm["mangrove", n_set]
         * OCEAN_AREA["mangrove", t_set, n_set] * 1e6
     )
@@ -416,7 +420,7 @@ def define_eqs(m, sets, params, cfg, v):
     ] = (
         OCEAN_NONUSE_VALUE["mangrove", t_set, n_set] ==
         gams_exp(par_value_intercept_nu["mangrove", n_set])
-        * (YNET[t_set, n_set] / par_pop[t_set, n_set] * 1e6)
+        * (par_ynet_level[t_set, n_set] / par_pop[t_set, n_set] * 1e6)
           ** par_value_exp_nu["mangrove", n_set]
         * OCEAN_AREA["mangrove", t_set, n_set] * 1e6
     )

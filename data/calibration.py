@@ -67,11 +67,15 @@ def load_and_calibrate(cfg):
     # Aggregate pop -- sum
     # ------------------------------------------------------------------
     pop_dict = {}
+    pop_country = {}  # (t, iso) -> population (country-level, for Burke rich/poor)
     for _, row in pop_raw.iterrows():
         if str(row.iloc[0]).upper() != ssp:
             continue
         t, n = int(row["t"]), str(row["n"]).lower()
-        if n not in mapping or t < 1 or t > T:
+        if t < 1 or t > T:
+            continue
+        pop_country[(t, n)] = row["Val"]
+        if n not in mapping:
             continue
         rname = gcam_names[mapping[n]]
         key = (t, rname)
@@ -110,6 +114,7 @@ def load_and_calibrate(cfg):
     # ------------------------------------------------------------------
     emi_bau_dict = {}   # (t, rname, ghg) -> value
     sigma_agg = {}      # (t, rname, ghg) -> value
+    emi_bau_country = {}  # (t, iso, ghg) -> value (country-level, for NDC weighting)
     for _, row in sigma_raw.iterrows():
         if str(row.iloc[0]).upper() != ssp:
             continue
@@ -121,6 +126,7 @@ def load_and_calibrate(cfg):
         rname = gcam_names[mapping[n]]
         ykali_n = ykali_country.get((t, n), 0.0)
         emi_n = convq_ghg[ghg] * row["Val"] * ykali_n
+        emi_bau_country[(t, n, ghg)] = emi_n
         key = (t, rname, ghg)
         emi_bau_dict[key] = emi_bau_dict.get(key, 0.0) + emi_n
 
@@ -425,9 +431,13 @@ def load_and_calibrate(cfg):
         data_dir, "data_mod_climate_regional", "climate_region_coef_cmip5.csv")
     alpha_temp_dict = {rn: 0.0 for rn in region_names}
     beta_temp_dict = {rn: 0.0 for rn in region_names}
+    alpha_precip_dict = {rn: 0.0 for rn in region_names}
+    beta_precip_dict = {rn: 0.0 for rn in region_names}
     base_temp_dict = {rn: 0.0 for rn in region_names}
     alpha_pop_weight = {rn: 0.0 for rn in region_names}
     beta_pop_weight = {rn: 0.0 for rn in region_names}
+    alpha_precip_pop_weight = {rn: 0.0 for rn in region_names}
+    beta_precip_pop_weight = {rn: 0.0 for rn in region_names}
     base_temp_pop_weight = {rn: 0.0 for rn in region_names}
 
     if os.path.exists(coef_file):
@@ -455,6 +465,12 @@ def load_and_calibrate(cfg):
             elif param in ("beta_temp", "slope"):
                 beta_temp_dict[rname] += row["Val"] * pop_n
                 beta_pop_weight[rname] += pop_n
+            elif param == "alpha_precip":
+                alpha_precip_dict[rname] += row["Val"] * pop_n
+                alpha_precip_pop_weight[rname] += pop_n
+            elif param == "beta_precip":
+                beta_precip_dict[rname] += row["Val"] * pop_n
+                beta_precip_pop_weight[rname] += pop_n
             elif param == "base_temp":
                 base_temp_dict[rname] += row["Val"] * pop_n
                 base_temp_pop_weight[rname] += pop_n
@@ -465,6 +481,10 @@ def load_and_calibrate(cfg):
                 alpha_temp_dict[rname] /= alpha_pop_weight[rname]
             if beta_pop_weight[rname] > 0:
                 beta_temp_dict[rname] /= beta_pop_weight[rname]
+            if alpha_precip_pop_weight[rname] > 0:
+                alpha_precip_dict[rname] /= alpha_precip_pop_weight[rname]
+            if beta_precip_pop_weight[rname] > 0:
+                beta_precip_dict[rname] /= beta_precip_pop_weight[rname]
             if base_temp_pop_weight[rname] > 0:
                 base_temp_dict[rname] /= base_temp_pop_weight[rname]
 
@@ -781,6 +801,76 @@ def load_and_calibrate(cfg):
         if rname not in pledge_nz_year_co2:
             pledge_nz_year_co2[rname] = 2310.0
 
+    # GHG (all greenhouse gases) net-zero pledge years.
+    # GAMS core_policy.gms line 233: long_term_pledges_year_ghg(n) = 2310
+    # GAMS line 236: loading from "Carbon neutral" is COMMENTED OUT.
+    # Therefore GHG constraint is effectively disabled by default.
+    pledge_nz_year_ghg = {}
+    for rname in region_names:
+        pledge_nz_year_ghg[rname] = 2310.0
+
+    # ------------------------------------------------------------------
+    # Historical responsibility: carbon debt from PRIMAP/WDI (1960-2010)
+    # GAMS core_policy.gms lines 252-258:
+    #   carbon_debt(n) = sum(yearlu 1960..2010,
+    #     l_valid_wdi(yearlu,n) * sum(nn, q_emi_primap('co2ffi',yearlu,nn)/l_valid_wdi(yearlu,nn))
+    #     - q_emi_primap('co2ffi',yearlu,n))
+    #   burden_share(n) = (epc_share + carbon_debt(n)/sum(nn,carbon_debt(nn))) / 2
+    # ------------------------------------------------------------------
+    carbon_debt_by_region = {}  # region_name -> carbon debt value
+    primap_file = os.path.join(data_dir, "data_historical_values", "q_emi_valid_primap.csv")
+    wdi_file = os.path.join(data_dir, "data_historical_values", "l_valid_wdi.csv")
+    if os.path.exists(primap_file) and os.path.exists(wdi_file):
+        primap_df = pd.read_csv(primap_file)
+        wdi_df = pd.read_csv(wdi_file)
+
+        # Build lookup: l_valid_wdi(year, iso) -> labour (millions)
+        l_wdi = {}  # (year, iso) -> val
+        for _, row in wdi_df.iterrows():
+            yr = int(row.iloc[0])
+            iso = str(row["n"]).lower()
+            l_wdi[(yr, iso)] = float(row["Val"])
+
+        # Build lookup: q_emi_primap('co2ffi', year, iso) -> emissions
+        emi_primap = {}  # (year, iso) -> val
+        for _, row in primap_df.iterrows():
+            if str(row.iloc[0]).lower() != "co2ffi":
+                continue
+            yr = int(row.iloc[1])
+            iso = str(row["n"]).lower()
+            emi_primap[(yr, iso)] = float(row["Val"])
+
+        # Get all ISO3 codes present in both datasets
+        all_isos_wdi = set(iso for (_, iso) in l_wdi.keys())
+        all_isos_primap = set(iso for (_, iso) in emi_primap.keys())
+        all_isos = all_isos_wdi & all_isos_primap
+
+        # Compute carbon debt per country, then aggregate to GCAM regions
+        carbon_debt_country = {}  # iso -> carbon debt
+        for yr in range(1960, 2011):
+            # Global average emissions per worker
+            total_emi = sum(emi_primap.get((yr, iso), 0.0) for iso in all_isos)
+            total_lab = sum(l_wdi.get((yr, iso), 0.0) for iso in all_isos)
+            if total_lab <= 0:
+                continue
+            global_emi_per_worker = total_emi / total_lab
+
+            for iso in all_isos:
+                lab_n = l_wdi.get((yr, iso), 0.0)
+                emi_n = emi_primap.get((yr, iso), 0.0)
+                # Fair share emissions - actual emissions = carbon debt
+                debt = lab_n * global_emi_per_worker - emi_n
+                carbon_debt_country[iso] = carbon_debt_country.get(iso, 0.0) + debt
+
+        # Aggregate to GCAM regions
+        for iso, debt in carbon_debt_country.items():
+            if iso not in mapping:
+                continue
+            rname = gcam_names[mapping[iso]]
+            if rname not in region_names:
+                continue
+            carbon_debt_by_region[rname] = carbon_debt_by_region.get(rname, 0.0) + debt
+
     # ------------------------------------------------------------------
     # Issue 13: Adaptation CES parameters from data_mod_damage
     # Load ces_ada (Dim1 x n -> Val) and owa (Dim1 x n -> Val)
@@ -855,7 +945,11 @@ def load_and_calibrate(cfg):
     coalitions = None  # None means default (each region = own coalition)
     cooperation = getattr(cfg, "cooperation", "coop")
     if cooperation in ("noncoop", "coalitions"):
-        coalitions = _load_coalitions(project_root, region_names, cooperation)
+        coalition_def = getattr(cfg, "coalition_def", None)
+        if cooperation == "coalitions" and coalition_def is not None:
+            coalitions = _parse_coalition_def(coalition_def, region_names)
+        else:
+            coalitions = _load_coalitions(project_root, region_names, cooperation)
 
     # ------------------------------------------------------------------
     # Assemble return dict
@@ -877,10 +971,12 @@ def load_and_calibrate(cfg):
         # sigma_agg and emi_bau_dict are now keyed (t, region, ghg)
         sigma_agg=sigma_agg,
         emi_bau_dict=emi_bau_dict,
+        emi_bau_country=emi_bau_country,
+        ykali_country=ykali_country,
+        pop_country=pop_country,
         # Aliases for solver.py multi-GHG path (keyed (t, region, ghg))
         sigma_agg_ghg=sigma_agg,
         emi_bau_ghg=emi_bau_dict,
-        ykali_country=ykali_country,
         # Initial conditions
         k0_agg=k0_agg,
         s0_agg=s0_agg,
@@ -917,6 +1013,8 @@ def load_and_calibrate(cfg):
         # Regional climate downscaling
         alpha_temp_dict=alpha_temp_dict,
         beta_temp_dict=beta_temp_dict,
+        alpha_precip_dict=alpha_precip_dict,
+        beta_precip_dict=beta_precip_dict,
         base_temp_dict=base_temp_dict,
         # MACC coefficients (keyed by (t, region, ghg))
         macc_c1_dict=macc_c1_dict,
@@ -927,6 +1025,9 @@ def load_and_calibrate(cfg):
         maxmiu_pbl=maxmiu_pbl,
         # Long-term pledges
         pledge_nz_year_co2=pledge_nz_year_co2,
+        pledge_nz_year_ghg=pledge_nz_year_ghg,
+        # Historical responsibility: carbon debt per region
+        carbon_debt_by_region=carbon_debt_by_region,
         # Adaptation CES parameters (Issue 13)
         ces_ada_agg=ces_ada_agg,
         owa_agg=owa_agg,
@@ -938,8 +1039,170 @@ def load_and_calibrate(cfg):
         sai_inj_labels=sai_inj_labels,
         # Coalition mappings (for iterative/Nash solving)
         coalitions=coalitions,
+        # MACC base context for batch mode (MACC-independent intermediates)
+        _macc_base_ctx=dict(
+            c1_country=locals().get("c1_country", {}),
+            c4_country=locals().get("c4_country", {}),
+            pbl_c1_country=locals().get("pbl_c1_country", {}),
+            pbl_c4_country=locals().get("pbl_c4_country", {}),
+            pbacktime=locals().get("pbacktime", {}),
+            alpha_logistic=locals().get("alpha_logistic", {}),
+            rice_regions_list=rice_regions_list,
+            mapping=mapping,
+            gcam_names=gcam_names,
+            region_names=region_names,
+            ykali_country=ykali_country,
+            emi_gwp=emi_gwp,
+            ghg_list=ghg_list,
+            T=T,
+            data_dir=data_dir,
+        ),
     )
     return data
+
+
+def compute_macc_bundle(base_ctx, macc_costs):
+    """Recompute MACC c1/c4 for a different macc_costs quantile.
+
+    Uses the MACC-independent intermediates from load_and_calibrate() to
+    avoid reloading CSVs and recomputing backstop parameters.
+
+    Parameters
+    ----------
+    base_ctx : dict
+        The '_macc_base_ctx' from load_and_calibrate() return value.
+    macc_costs : str
+        MACC quantile: "prob25" | "prob33" | "prob50" | "prob66" | "prob75"
+
+    Returns
+    -------
+    dict with keys: macc_c1, macc_c4 (keyed by (t, region, ghg))
+    """
+    c1_country = base_ctx["c1_country"]
+    c4_country = base_ctx["c4_country"]
+    pbl_c1_country = base_ctx["pbl_c1_country"]
+    pbl_c4_country = base_ctx["pbl_c4_country"]
+    pbacktime = base_ctx["pbacktime"]
+    alpha_logistic = base_ctx["alpha_logistic"]
+    rice_regions_list = base_ctx["rice_regions_list"]
+    mapping = base_ctx["mapping"]
+    gcam_names = base_ctx["gcam_names"]
+    region_names = base_ctx["region_names"]
+    ykali_country = base_ctx["ykali_country"]
+    emi_gwp = base_ctx["emi_gwp"]
+    ghg_list = base_ctx["ghg_list"]
+    T = base_ctx["T"]
+    data_dir = base_ctx["data_dir"]
+
+    # Initialize output
+    macc_c1_dict = {}
+    macc_c4_dict = {}
+    for t in range(1, T + 1):
+        for rn in region_names:
+            for ghg in ghg_list:
+                macc_c1_dict[(t, rn, ghg)] = 0.0
+                macc_c4_dict[(t, rn, ghg)] = 0.0
+
+    # Load MXstart for the requested quantile
+    mx_file = os.path.join(data_dir, "data_mod_macc", "mx_correction_factor.csv")
+    mx_start_raw = {}
+    if os.path.exists(mx_file):
+        mx_df = pd.read_csv(mx_file)
+        for _, row in mx_df.iterrows():
+            sec = str(row.iloc[0])
+            quant = str(row.iloc[1]).lower()
+            if sec != "Total_CO2" or quant != macc_costs:
+                continue
+            t_val = int(row["t"])
+            n_val = str(row["n"]).lower()
+            if t_val < 1 or t_val > T:
+                continue
+            mx_start_raw[(t_val, n_val)] = max(row["Val"], 0.0)
+
+    # CO2: apply mx correction and aggregate
+    if c1_country:
+        c1_adj_country = {}
+        c4_adj_country = {}
+        for t in range(1, T + 1):
+            for iso in rice_regions_list:
+                c1_val = c1_country.get((t, iso), 0.0)
+                c4_val = c4_country.get((t, iso), 0.0)
+                mac_at_1 = c1_val + c4_val
+                MXpback = pbacktime[t] / mac_at_1 if mac_at_1 > 0 else 0.0
+                MXstart = mx_start_raw.get((t, iso), 1.0)
+                mx_val = MXstart - alpha_logistic[t] * max(MXstart - MXpback, 0.0)
+                c1_adj_country[(t, iso)] = mx_val * c1_val
+                c4_adj_country[(t, iso)] = mx_val * c4_val
+
+        # GDP-weighted aggregation
+        for t in range(1, T + 1):
+            c1_num, c4_num = {}, {}
+            c1_wgt, c4_wgt = {}, {}
+            for iso in rice_regions_list:
+                if iso not in mapping:
+                    continue
+                rname = gcam_names[mapping[iso]]
+                if rname not in region_names:
+                    continue
+                w = ykali_country.get((t, iso), 0)
+                c1_v = c1_adj_country.get((t, iso), 0.0)
+                c4_v = c4_adj_country.get((t, iso), 0.0)
+                if c1_v > 0 or (t, iso) in c1_country:
+                    c1_num[rname] = c1_num.get(rname, 0.0) + c1_v * w
+                    c1_wgt[rname] = c1_wgt.get(rname, 0.0) + w
+                if c4_v > 0 or (t, iso) in c4_country:
+                    c4_num[rname] = c4_num.get(rname, 0.0) + c4_v * w
+                    c4_wgt[rname] = c4_wgt.get(rname, 0.0) + w
+            for rname in region_names:
+                key = (t, rname, "co2")
+                if c1_wgt.get(rname, 0) > 0:
+                    macc_c1_dict[key] = c1_num.get(rname, 0) / c1_wgt[rname]
+                if c4_wgt.get(rname, 0) > 0:
+                    macc_c4_dict[key] = c4_num.get(rname, 0) / c4_wgt[rname]
+
+    # Non-CO2: apply mx correction and aggregate
+    if pbl_c1_country:
+        for ghg in ("ch4", "n2o"):
+            gwp = emi_gwp.get(ghg, 25.0 if ghg == "ch4" else 298.0)
+            pbl_c1_adj, pbl_c4_adj = {}, {}
+            for t in range(1, T + 1):
+                for iso in rice_regions_list:
+                    c1_v = pbl_c1_country.get((t, iso, ghg), 0.0)
+                    c4_v = pbl_c4_country.get((t, iso, ghg), 0.0)
+                    mac_at_max = c1_v + c4_v
+                    MXpback = pbacktime[t] / (mac_at_max / gwp) if mac_at_max > 0 and gwp > 0 else 0.0
+                    MXstart = mx_start_raw.get((t, iso), 1.0)
+                    mx_val = MXstart - alpha_logistic[t] * max(MXstart - MXpback, 0.0)
+                    pbl_c1_adj[(t, iso, ghg)] = mx_val * c1_v
+                    pbl_c4_adj[(t, iso, ghg)] = mx_val * c4_v
+
+            pbl_c1_num, pbl_c4_num = {}, {}
+            pbl_c1_wgt, pbl_c4_wgt = {}, {}
+            for t in range(1, T + 1):
+                for iso in rice_regions_list:
+                    if iso not in mapping:
+                        continue
+                    rname = gcam_names[mapping[iso]]
+                    if rname not in region_names:
+                        continue
+                    w = ykali_country.get((t, iso), 0)
+                    c1_v = pbl_c1_adj.get((t, iso, ghg), 0.0)
+                    c4_v = pbl_c4_adj.get((t, iso, ghg), 0.0)
+                    key = (t, rname, ghg)
+                    if c1_v > 0 or (t, iso, ghg) in pbl_c1_country:
+                        pbl_c1_num[key] = pbl_c1_num.get(key, 0.0) + c1_v * w
+                        pbl_c1_wgt[key] = pbl_c1_wgt.get(key, 0.0) + w
+                    if c4_v > 0 or (t, iso, ghg) in pbl_c4_country:
+                        pbl_c4_num[key] = pbl_c4_num.get(key, 0.0) + c4_v * w
+                        pbl_c4_wgt[key] = pbl_c4_wgt.get(key, 0.0) + w
+            for key in pbl_c1_wgt:
+                if pbl_c1_wgt[key] > 0:
+                    macc_c1_dict[key] = pbl_c1_num[key] / pbl_c1_wgt[key]
+            for key in pbl_c4_wgt:
+                if pbl_c4_wgt[key] > 0:
+                    macc_c4_dict[key] = pbl_c4_num[key] / pbl_c4_wgt[key]
+
+    return dict(macc_c1=macc_c1_dict, macc_c4=macc_c4_dict)
 
 
 def _load_coalitions(project_root, region_names, cooperation):
@@ -982,6 +1245,49 @@ def _load_coalitions(project_root, region_names, cooperation):
 
     # Fallback: noncoop (each region = own coalition)
     return [[r] for r in region_names]
+
+
+def _parse_coalition_def(coalition_def, region_names):
+    """Parse coalition definitions from user config.
+
+    Parameters
+    ----------
+    coalition_def : dict or str
+        If dict: {coalition_name: [region_name, ...]}
+        If str: path to JSON file with same structure
+    region_names : list
+        Active region names
+
+    Returns
+    -------
+    list of lists: [[region1, region2, ...], [region3], ...]
+    Regions not assigned to any coalition become singleton coalitions.
+    """
+    import json
+
+    if isinstance(coalition_def, str):
+        with open(coalition_def) as f:
+            coalition_def = json.load(f)
+
+    if not isinstance(coalition_def, dict):
+        return [[r] for r in region_names]
+
+    region_set = set(region_names)
+    assigned = set()
+    coalitions = []
+
+    for clt_name, members in coalition_def.items():
+        valid_members = [r for r in members if r in region_set]
+        if valid_members:
+            coalitions.append(valid_members)
+            assigned.update(valid_members)
+
+    # Unassigned regions become singleton coalitions
+    for r in region_names:
+        if r not in assigned:
+            coalitions.append([r])
+
+    return coalitions
 
 
 def _parse_coalition_inc(inc_path, region_set):
