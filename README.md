@@ -1,10 +1,10 @@
 # PyDICE32
 
-Python/GAMSPy implementation of the [RICE50x](https://github.com/witch-team/RICE50xmodel) integrated assessment model with 32 GCAM regions.
+Python/GAMSPy implementation of the [RICE50x](https://github.com/witch-team/RICE50xmodel) integrated assessment model with 32 GCAM v8+ regions.
 
 ## Overview
 
-PyDICE32 translates the GAMS-based RICE50x model into a modular Python package using [GAMSPy](https://gamspy.readthedocs.io/). The model aggregates 155 ISO3 countries into 32 [GCAM](https://jgcri.github.io/gcam-doc/) regions and solves a Ramsey-type optimal growth model coupled with a climate system, damage functions, and abatement cost curves.
+PyDICE32 translates the GAMS-based RICE50x model into a modular Python package using [GAMSPy](https://gamspy.readthedocs.io/). The model aggregates 155 ISO3 countries into 32 [GCAM v8+](https://jgcri.github.io/gcam-doc/) regions and solves a Ramsey-type optimal growth model coupled with a climate system, damage functions, and abatement cost curves.
 
 Modular architecture with ~110 equations verified against the native GAMS source.
 
