@@ -81,6 +81,14 @@ Recommendation
 
 - Coalition presets are still not source-ported. The difference is now explicit rather than hidden: `pydice32/config.py:155-163`, `pydice32/__main__.py:92-99`, `pydice32/README.md:65`, `pydice32/README.md:227`.
 
+## Self-Identified Limitation: Post-Process Damage Calculator
+
+`postprocess_damages()` computes damages on YGROSS (the no-feedback GDP path). When damages are large (e.g., BAU at 3.5C), this overstates damages by ~4x compared to the endogenous path where damages reduce GDP which in turn reduces damages. This is the same behavior as GAMS `damages_postprocessed` mode — it is structural, not a bug.
+
+Practical impact: postprocess damages are useful for **relative comparison** between policies (e.g., CTax30 vs CTax50 post-hoc damage difference) but should not be compared directly against endogenous damage scenarios.
+
+Additionally, `ctax` with `ctax_marginal=False` (fiscal revenue) does not constrain MAC, so the tax level has no effect on abatement when `impact="off"`. Use `ctax_marginal=True` for meaningful carbon tax scenarios.
+
 ## Legacy Residual Still Present
 
 - `ctax_marginal` still uses `MAC <= tax` instead of the source equality branch `MAC = tax`: `pydice32/modules/core_policy.py:428-437`, `RICE50xmodel/modules/core_policy.gms:405-406`.

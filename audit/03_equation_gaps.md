@@ -29,6 +29,14 @@ This file focuses on the structural gaps that remain after the latest fixes.
 | Coalition presets | Uses `sel_coalition` + `coalitions/coal_*.gms` | User-defined `coalition_def` only; difference is now documented | `partial but explicit` |
 | Extra 3D best-response controls | Inactive for non-active regions via `reg(n)` gating | Restore path exists, but region-column inference for `SAI(t,n,inj)` is still heuristic and fragile | `partial` |
 
+## Post-Process Damage Calculator
+
+| Item | Behavior | Known Limitation | Status |
+| --- | --- | --- | --- |
+| `postprocess_damages()` | Computes damages from solved TATM path using pure Python (no GAMSPy) | Damages are computed on YGROSS (no-feedback GDP), not on feedback-reduced GDP. BAU postprocess gives ~4x higher damages than endogenous BAU because YGROSS >> YNET when damages are large. This is structural, not a bug — same as GAMS `damages_postprocessed`. | `known limitation` |
+| `ctax` + `ctax_marginal=False` + `impact=kalkuhl` | Fiscal revenue approach does not constrain MAC; optimizer finds CBA optimal regardless of tax level | Use `ctax_marginal=True` for tax-driven scenarios, or `impact="off"` with postprocess | `by design` |
+| `ctax` + `impact="off"` + `ctax_marginal=False` | Tax enters eq_yy but MAC is unconstrained; near-zero abatement results | Same issue: fiscal term alone insufficient without MAC constraint | `by design` |
+
 ## Residual Legacy Gap
 
 | Source item | GAMS source behavior | Current PyDICE32 behavior | Status |
