@@ -76,15 +76,19 @@ def define_eqs(m, sets, params, cfg, v):
     MIU = v["MIU"]
 
     # ------------------------------------------------------------------
-    # MIU upper bounds for non-CO2 (GAMS core_abatement.gms compute_vars)
-    # GAMS: MIU.up(t,n,ghg)$(not tmiufix(t) and not sameas(ghg,'co2')) = maxmiu_pbl(t,n,ghg)
-    # For non-CO2 GHGs, override MIU.up with species-specific max from PBL data.
-    # Skip for bau/bau_impact/simulation where MIU is fixed to 0 in core_policy,
-    # because setting .up here (in define_eqs, Pass 2) would override the .fx
-    # set in declare_vars (Pass 1).
+    # MIU upper bounds (GAMS core_abatement.gms compute_vars)
+    # GAMS: MIU.up(t,n,ghg)$(not tmiufix(t)) = maxmiu_pbl(t,n,ghg)
+    # Must skip tmiufix periods AND bau/bau_impact/simulation (MIU.fx=0
+    # for all t), because setting .up in define_eqs (Pass 2) overrides
+    # the .fx set in core_policy declare_vars (Pass 1).
     # ------------------------------------------------------------------
-    if cfg.policy not in ("bau", "bau_impact", "simulation"):
-        MIU.up[t_set, n_set, ghg_set] = par_maxmiu_pbl[t_set, n_set, ghg_set]
+    if cfg.policy in ("bau", "bau_impact", "simulation"):
+        pass  # MIU.fx=0 for all periods, don't override
+    else:
+        tmiufix_set = set(cfg.tmiufix)
+        for t_idx in range(1, cfg.T + 1):
+            if t_idx not in tmiufix_set:
+                MIU.up[str(t_idx), n_set, ghg_set] = par_maxmiu_pbl[str(t_idx), n_set, ghg_set]
 
     # ------------------------------------------------------------------
     # Equations

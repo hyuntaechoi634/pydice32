@@ -47,9 +47,10 @@ def declare_vars(m, sets, params, cfg, v):
 
     # ------------------------------------------------------------------
     # Fixed initial conditions
+    # GAMS: MIULAND.fx(t,n)$(tmiufix(t)) = 0
     # ------------------------------------------------------------------
-    MIULAND.fx["1", n_set] = 0
-    MIULAND.fx["2", n_set] = 0
+    for t_idx in cfg.tmiufix:
+        MIULAND.fx[str(t_idx), n_set] = 0
 
     # Register in shared variable dict
     v["ELAND"] = ELAND
